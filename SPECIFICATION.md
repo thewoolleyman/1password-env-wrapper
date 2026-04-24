@@ -10,14 +10,20 @@ implementation whenever this specification changes:
 > file the specification prescribes so that the repository matches the
 > spec exactly. Do not add files the spec does not describe. Never
 > check any rendered `with-<identifier>-env.sh` into git; it is
-> generated output. Every checked-in `*.sh` file must start with
-> `#!/usr/bin/env bash`, enable `set -Eeuo pipefail`, be `chmod +x`,
-> and pass `shellcheck` with no findings. Update `AGENTS.md` whenever
-> the user-facing workflow changes. Do not execute the installer as
-> part of implementing the repo — the installer must be run by a human
-> operator with `sudo`. If any section of the spec is ambiguous or
-> internally inconsistent, stop and report the ambiguity before making
-> a judgement call.
+> generated output. Never check `.env.local` into git; it is the
+> gitignored bootstrap secret file. Every checked-in `*.sh` file must
+> start with `#!/usr/bin/env bash`, enable `set -Eeuo pipefail`, be
+> `chmod +x`, and pass `shellcheck` with no findings. Update
+> `AGENTS.md` whenever the user-facing workflow changes. Do not
+> execute the installer yourself at implementation time; after the
+> implementation is in place, run the BATS integration test at
+> `test/integration.bats` (which invokes the installer under `sudo`
+> with the bootstrap token loaded from `.env.local`) to prove the
+> happy path end-to-end. If `.env.local` is missing or still contains
+> `PLACEHOLDER`, stop and tell the human operator to populate it
+> instead of fabricating a token. If any section of the spec is
+> ambiguous or internally inconsistent, stop and report the ambiguity
+> before making a judgement call.
 
 ## Overview
 
@@ -77,8 +83,10 @@ editor state, license files) are permitted but out of scope.
 | `AGENTS.md` | yes | Human- and agent-facing usage guide; includes an example shell interaction using `openbrain` as the identifier. |
 | `create-1password-env-wrapper.sh` | yes | Installer. Validates inputs, renders the wrapper, stores the service account token, and installs the wrapper on the system. |
 | `print-test-env-vars.sh` | yes | Test target. Prints every environment variable whose name starts with `TEST_`. Used to prove injection works by invoking the installed wrapper against this script. |
-| `.gitignore` | yes | Ignores any rendered wrapper at the repository root via the pattern `/with-*-env.sh`. |
+| `test/integration.bats` | yes | BATS integration test that drives the installer with the `.env.local` bootstrap token and asserts the happy path end-to-end. |
+| `.gitignore` | yes | Ignores the rendered wrapper (`/with-*-env.sh`) and the bootstrap secret file (`.env.local`). |
 | `with-<IDENTIFIER>-env.sh` | **no (gitignored)** | Rendered wrapper build artifact produced by the installer; copied into `INSTALL_PREFIX` during installation. |
+| `.env.local` | **no (gitignored)** | Bootstrap secret file holding real service account tokens used to run the integration test on a developer or operator machine. |
 
 All shell scripts in this repository SHALL:
 
@@ -315,12 +323,120 @@ correctly. It SHALL:
 
 The 1Password Environment referenced by the wrapper SHOULD contain at
 least two variables whose names start with `TEST_` so that this
-script's output can be used as a human-readable smoke test. A typical
-verification run is:
+script's output can be used as a human-readable smoke test. For the
+integration test described below, the Environment MUST contain
+`TEST_CREDENTIAL=TEST_VALUE`. A typical verification run is:
 
 ```text
 sudo -u <IDENTIFIER> with-<IDENTIFIER>-env.sh /absolute/path/to/print-test-env-vars.sh
 ```
+
+## Bootstrap Secret File: `.env.local`
+
+`.env.local` is the gitignored bootstrap secret file used to drive
+the installer during development and integration testing. It is not
+part of the installer's production input surface — production
+operators pass `OP_SERVICE_ACCOUNT_TOKEN` directly on the installer
+command line. `.env.local` exists so that automated checks (including
+the BATS integration test) can run repeatably without an operator
+re-entering secrets.
+
+Required properties:
+
+- Location: repository root.
+- Always gitignored. The repository's `.gitignore` SHALL list
+  `.env.local`.
+- Format: a plain `KEY=VALUE` file, one entry per line, no quoting,
+  no surrounding whitespace, no inline comments. Lines beginning with
+  `#` and blank lines are permitted.
+- Naming convention for tokens: one entry per supported identifier
+  of the form
+  `<IDENTIFIER_UPPERCASE>_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>`,
+  where `<IDENTIFIER_UPPERCASE>` is the identifier in upper case
+  with any hyphens replaced by underscores. For the default
+  identifier `openbrain`, the entry is
+  `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>`.
+- When a fresh clone ships a placeholder value (`PLACEHOLDER`),
+  consumers SHALL treat that as "not yet configured" and refuse to
+  proceed until a real token has been pasted in by the operator.
+
+Consumers of `.env.local` (the integration test; any future
+developer-mode runner) SHALL read it directly (for example via
+`set -a; source ./.env.local; set +a` in a clean subshell) and SHALL
+NOT modify it.
+
+## Integration Test: `test/integration.bats`
+
+`test/integration.bats` is a [Bats](https://bats-core.readthedocs.io/)
+test file that exercises the installer and the installed wrapper
+end-to-end against real 1Password infrastructure. It is the
+authoritative proof that the repository satisfies the happy-path
+acceptance scenarios in this specification.
+
+The test SHALL use the identifier `openbrain` and assume that:
+
+- a Linux user and group `openbrain` exist on the host;
+- a 1Password service account, vault, and Environment all named
+  `openbrain` exist;
+- that Environment contains at least the variable
+  `TEST_CREDENTIAL=TEST_VALUE`;
+- `.env.local` at the repository root contains
+  `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>`;
+- the host provides `bats`, `op`, `sudo`, and the BATS support
+  libraries `bats-support` and `bats-assert` (or equivalents)
+  available on `PATH` or via `load`.
+
+### Behavior
+
+The test file SHALL:
+
+1. In `setup_file` (or equivalent), load `.env.local`, fail fast if
+   the file is missing or if
+   `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN` is absent or equals
+   `PLACEHOLDER`, and export the token as `OP_SERVICE_ACCOUNT_TOKEN`
+   only for installer invocations (not as a global test-process
+   env var).
+2. Invoke the installer under `sudo -E` with `IDENTIFIER=openbrain`,
+   capturing stdout, stderr, and exit status. Assert exit status
+   `0`, that the installer reported installing
+   `/usr/local/bin/with-openbrain-env.sh`, and that the installer
+   output contains neither the raw token value nor the placeholder
+   string.
+3. Assert that `/usr/local/bin/with-openbrain-env.sh` exists, is
+   owned by `root:openbrain`, and has mode `0750`.
+4. Assert that `.gitignore` at the repository root contains the
+   patterns `/with-*-env.sh` and `.env.local`.
+5. Run the installed wrapper as the `openbrain` user against
+   `print-test-env-vars.sh` in the repository checkout. Assert:
+   - exit status `0`;
+   - the output contains exactly the line `TEST_CREDENTIAL=TEST_VALUE`;
+   - the output is sorted by variable name;
+   - the output contains no `OP_SERVICE_ACCOUNT_TOKEN=` line.
+6. Run the installed wrapper as the `openbrain` user with the
+   command `env`; assert `TEST_CREDENTIAL=TEST_VALUE` appears in the
+   output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
+7. Run the installed wrapper as the `openbrain` user with the
+   command `printenv OP_SERVICE_ACCOUNT_TOKEN` and assert the
+   wrapper exit status is `1` (variable unset), confirming that the
+   secret-zero token is not inherited by the child.
+
+The test SHALL be idempotent: rerunning it SHALL succeed whether or
+not a prior install exists. The test SHOULD NOT remove the installed
+wrapper, token credential, or `CONFIG_DIR` contents on teardown;
+cleanup is an operator concern.
+
+### Invocation
+
+Operators run the test from the repository root:
+
+```text
+bats test/integration.bats
+```
+
+The test itself invokes `sudo` where needed; the outer `bats` process
+does not need to run as root, but the session MUST be able to escalate
+via `sudo` without a password prompt, or the operator MUST be
+prepared to enter their password at the first escalation.
 
 ## Usage Documentation: `AGENTS.md`
 
@@ -347,7 +463,11 @@ sudo -u <IDENTIFIER> with-<IDENTIFIER>-env.sh /absolute/path/to/print-test-env-v
 7. **Rotating the service account token** — rerun the installer with
    the replacement `OP_SERVICE_ACCOUNT_TOKEN`; the stored credential
    and the rendered/installed wrapper are replaced atomically.
-8. **Example shell interaction** — a transcript using `openbrain` as
+8. **Running the integration test** — how to populate `.env.local`
+   with a real
+   `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>` (starting from
+   the placeholder), and how to run `bats test/integration.bats`.
+9. **Example shell interaction** — a transcript using `openbrain` as
    the identifier (so the wrapper command name is
    `with-openbrain-env.sh`), showing: an operator running the
    installer under `sudo`; `openbrain` running a wrapped command;
@@ -362,16 +482,21 @@ details.
 
 ## Gitignore: `.gitignore`
 
-`.gitignore` at the repository root SHALL contain a line that ignores
-rendered wrapper build artifacts at the repository root:
+`.gitignore` at the repository root SHALL contain at least these
+entries:
 
 ```text
 /with-*-env.sh
+.env.local
 ```
 
-This pattern covers any `IDENTIFIER` value. The installer MAY append
-this line if it is missing. The installer SHALL NOT modify any other
-`.gitignore` entries.
+- `/with-*-env.sh` ignores the rendered wrapper build artifact at
+  the repository root for any `IDENTIFIER` value.
+- `.env.local` ignores the bootstrap secret file used by the
+  integration test.
+
+The installer MAY append either line if it is missing. The installer
+SHALL NOT rewrite, reorder, or remove any other `.gitignore` entries.
 
 ## Security Constraints
 
@@ -446,10 +571,12 @@ directly
 And `${INSTALL_PREFIX}/with-openbrain-env.sh` exists with owner
 `root:openbrain` and mode `0750`
 
-And `.gitignore` at the repository root ignores `/with-*-env.sh`
+And `.gitignore` at the repository root ignores both `/with-*-env.sh`
+and `.env.local`
 
-And no `.env`, `.env.local`, or similar file has been written with
-fetched Environment variables
+And no `.env` or similar file has been written with fetched
+Environment variables (the pre-existing `.env.local` bootstrap file
+SHALL NOT have been rewritten by the installer)
 
 ### Scenario: Wrapper starts an interactive shell
 
@@ -516,3 +643,23 @@ Then the persisted credential or token file is replaced atomically
 And subsequent wrapper invocations use the replacement token
 
 And no fetched Environment variables have been persisted to disk
+
+### Scenario: BATS integration test proves the happy path
+
+Given `.env.local` at the repository root contains a real
+`OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN` (not `PLACEHOLDER`)
+
+And the `openbrain` Linux user and group exist
+
+And the 1Password Environment `openbrain` contains `TEST_CREDENTIAL=TEST_VALUE`
+
+When the operator runs `bats test/integration.bats`
+
+Then the installer completes successfully with `IDENTIFIER=openbrain`
+
+And the installed wrapper injects `TEST_CREDENTIAL=TEST_VALUE` into
+the child process invoked against `print-test-env-vars.sh`
+
+And `OP_SERVICE_ACCOUNT_TOKEN` is not present in the child process
+
+And every BATS assertion passes
