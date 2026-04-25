@@ -21,9 +21,12 @@ implementation whenever this specification changes:
 > with the bootstrap token loaded from `.env.local`) to prove the
 > happy path end-to-end. If `.env.local` is missing or still contains
 > `PLACEHOLDER`, stop and tell the human operator to populate it
-> instead of fabricating a token. If any section of the spec is
-> ambiguous or internally inconsistent, stop and report the ambiguity
-> before making a judgement call.
+> instead of fabricating a token. Use your best judgement for
+> implementation details that the spec does not nail down (exact `op`
+> subcommand choice, shellcheck-friendly idioms, error wording);
+> briefly note the judgements made at the end of the run. Only stop
+> and ask the operator when the spec is flatly contradictory or
+> requires information you cannot obtain.
 
 ## Overview
 
@@ -120,13 +123,17 @@ All shell scripts in this repository SHALL:
    from a process substitution, or an equivalent subcommand). The
    implementer is expected to consult the 1Password CLI documentation
    and pick the simplest mechanism that satisfies this principle.
-5. **Token is not readable by the target user.** The service account
-   token SHALL be persisted such that the Linux user named by
-   `IDENTIFIER` cannot read it directly. Acceptable storage
-   mechanisms are an encrypted systemd credential (preferred) and a
-   root-owned token file with mode `0600` (portability fallback).
-   The wrapper, executable by the Linux group named by `IDENTIFIER`,
-   is the only supported path through which the token is used.
+5. **Token access is scoped to the `IDENTIFIER` group.** The service
+   account token SHALL be persisted such that only `root` and members
+   of the Linux group named by `IDENTIFIER` can read it. Acceptable
+   storage mechanisms are an encrypted systemd credential (advanced;
+   used only when the operator explicitly opts in) and a
+   group-readable token file owned by `root:<IDENTIFIER>` with mode
+   `0640` (default). This intentionally permits the `IDENTIFIER`
+   user to read the raw token directly — the wrapper is the
+   recommended access path, not a technical gate. Stronger isolation
+   would require a setuid binary or a sudoers rule, both of which
+   are out of scope for v1.
 6. **Works from any directory.** The installed wrapper SHALL NOT
    depend on the caller's current working directory, repository
    location, or shell startup files.
@@ -168,9 +175,12 @@ input if any required input is absent.
 - `CONFIG_DIR` — root-owned configuration directory. Default:
   `/etc/onepassword-env-wrapper`.
 - `TOKEN_STORAGE_MODE` — either `systemd-credential` or
-  `root-owned-file`. If omitted, the installer SHALL prefer
-  `systemd-credential` when supported on the host and fall back to
-  `root-owned-file` otherwise.
+  `root-owned-file`. Default: `root-owned-file`. The
+  `systemd-credential` mode is advanced and requires the operator
+  to arrange a privileged wrapper execution path themselves; the
+  installer SHALL fail fast with a clear message when
+  `systemd-credential` is selected but the host does not support
+  it.
 - `DEFAULT_SHELL` — shell to execute when the wrapper is invoked
   without a command. Default: `/bin/bash`.
 
@@ -184,17 +194,23 @@ The installer SHALL, in order:
 1. Verify the host is Linux; exit non-zero on other platforms.
 2. Verify it is running as `uid 0`; exit non-zero with guidance to
    rerun under `sudo` otherwise.
-3. Verify `op` is installed and is a version that supports service
-   account tokens and Environment injection. Report the minimum
-   required version in the failure message.
+3. Verify `op` is installed and on `PATH` (e.g. `op --version`
+   returns successfully). The installer SHALL NOT attempt a stricter
+   semantic-version check; if the installed `op` lacks a feature the
+   wrapper needs, the wrapper's own invocation of `op` will surface
+   that at validation time in step 11.
 4. Verify the Linux user `IDENTIFIER` and the Linux group
    `IDENTIFIER` both exist.
 5. Validate all required inputs, including the `IDENTIFIER` regex.
    Exit non-zero on missing or invalid input, naming each offending
    input, without writing any files and without printing secret
    values.
-6. Create `CONFIG_DIR` with owner `root:root` and mode `0700` if it
-   does not already exist.
+6. Create `CONFIG_DIR` with owner `root:<IDENTIFIER>` and mode
+   `0750` if it does not already exist (so the `IDENTIFIER` group
+   can traverse into it to reach the token file and the
+   configuration file). When `CONFIG_DIR` already exists but has
+   ownership or mode that is incompatible with this contract, the
+   installer SHALL `chown`/`chmod` it to match.
 7. Render the wrapper to `./with-<IDENTIFIER>-env.sh` at the
    repository root with mode `0755`, baking in the resolved
    `IDENTIFIER`, `CONFIG_DIR`, Environment identifier,
@@ -205,28 +221,31 @@ The installer SHALL, in order:
      `/etc/credstore.encrypted` named for the identifier (for
      example `1password-env-wrapper-<IDENTIFIER>`), scoped such that
      only the wrapper's runtime context can decrypt it;
-   - `root-owned-file`: write the token to a file named
-     `<IDENTIFIER>.token` inside `CONFIG_DIR` with owner `root:root`
-     and mode `0600`. Write atomically: create a sibling temp file,
-     `fsync`, `rename`.
-9. Install a root-owned non-secret configuration file inside
-   `CONFIG_DIR` (for example `<IDENTIFIER>.conf`) containing values
-   such as the 1Password Environment ID, the identifier, and the
-   default shell. The configuration file SHALL NOT contain the
-   service account token.
+   - `root-owned-file` (default): write the token to a file named
+     `<IDENTIFIER>.token` inside `CONFIG_DIR` with owner
+     `root:<IDENTIFIER>` and mode `0640`. Write atomically: create a
+     sibling temp file in the same directory, write the token, then
+     `mv` (same-filesystem rename is atomic on Linux).
+9. Install a non-secret configuration file inside `CONFIG_DIR` (for
+   example `<IDENTIFIER>.conf`) with owner `root:<IDENTIFIER>` and
+   mode `0640`, containing values such as the 1Password Environment
+   ID, the identifier, and the default shell. The configuration file
+   SHALL NOT contain the service account token, and it MAY be read
+   directly by the wrapper when it runs as the `IDENTIFIER` user.
 10. Install the wrapper by copying `./with-<IDENTIFIER>-env.sh` to
     `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` with owner
     `root:<IDENTIFIER>` and mode `0750`, atomically (write to a
-    sibling temp file, `fsync`, `rename`).
+    sibling temp file in the same directory, then `mv` into place).
 11. Perform a read-only validation by invoking the installed wrapper
     (or an equivalent `op` invocation with the stored token) and
     confirming the 1Password Environment named by `IDENTIFIER` can
     be read. Exit non-zero on failure, leaving any pre-existing
     installed wrapper and token unchanged.
-12. Ensure `.gitignore` at the repository root contains the entry
-    `/with-*-env.sh`. If the entry already exists, leave `.gitignore`
-    unchanged. The installer SHALL NOT rewrite or reorder unrelated
-    `.gitignore` contents.
+12. Ensure `.gitignore` at the repository root contains the entries
+    `/with-*-env.sh` and `.env.local`. For each entry that is
+    already present, leave `.gitignore` unchanged; any missing entry
+    SHALL be appended on its own line. The installer SHALL NOT
+    rewrite or reorder unrelated `.gitignore` contents.
 13. Print a success line naming the installed wrapper path, the token
     storage mode, and the token location (credential name or file
     path). The success line SHALL NOT include the token value.
@@ -264,21 +283,26 @@ with-<IDENTIFIER>-env.sh [--] [command [arg ...]]
 The wrapper SHALL:
 
 - read the service account token via the configured
-  `TOKEN_STORAGE_MODE` (systemd credential decrypt or root-owned file
-  read); the file-mode read path requires the privileged execution
-  path arranged by the installer (e.g. `setgid`-bound helper, systemd
-  unit, or equivalent), since the user named by `IDENTIFIER` cannot
-  read the raw token file directly;
+  `TOKEN_STORAGE_MODE` (systemd credential decrypt, or direct read
+  of the group-readable token file in `CONFIG_DIR`);
 - unset `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` before invoking
   `op`, because 1Password Connect variables take precedence over
   `OP_SERVICE_ACCOUNT_TOKEN`;
 - set `OP_SERVICE_ACCOUNT_TOKEN` only in the environment of the `op`
-  process itself, and ensure the final child command or shell does
-  not inherit `OP_SERVICE_ACCOUNT_TOKEN`;
+  process itself (for example via `env OP_SERVICE_ACCOUNT_TOKEN=... op ...`
+  or an inline `OP_SERVICE_ACCOUNT_TOKEN=... op ...`), and ensure the
+  final child command or shell does not inherit
+  `OP_SERVICE_ACCOUNT_TOKEN`;
 - set `OP_CACHE=false` unless a future explicit configuration permits
   caching;
 - invoke `op` in a mode that injects Environment variables directly
-  into the child process without writing them to disk.
+  into the child process without writing them to disk. The canonical
+  choice is `op run --env-file=<path>` where `<path>` is a file
+  whose lines reference 1Password secrets; equivalent `op`
+  subcommands are acceptable so long as no fetched value is written
+  to disk outside `op`'s own transient buffers. When the wrapper is
+  invoked with no command, invoke the interactive shell explicitly
+  (e.g. pass `-i` to `bash`) so the user gets an interactive prompt.
 
 The wrapper SHALL fail closed with a non-zero exit code and an error
 message (but no secret values) when:
@@ -407,7 +431,13 @@ The test file SHALL:
 4. Assert that `.gitignore` at the repository root contains the
    patterns `/with-*-env.sh` and `.env.local`.
 5. Run the installed wrapper as the `openbrain` user against
-   `print-test-env-vars.sh` in the repository checkout. Assert:
+   `print-test-env-vars.sh`. Because the repository checkout MAY
+   sit under a path that the `openbrain` user cannot traverse, the
+   test SHALL stage an executable copy of `print-test-env-vars.sh`
+   at a world-readable path that `openbrain` can reach (for example
+   `/tmp/print-test-env-vars.<random>.sh`, `chmod 0755`), run the
+   wrapper against that staged path, and remove the staged copy on
+   teardown. Assert:
    - exit status `0`;
    - the output contains exactly the line `TEST_CREDENTIAL=TEST_VALUE`;
    - the output is sorted by variable name;
@@ -508,12 +538,15 @@ SHALL NOT rewrite, reorder, or remove any other `.gitignore` entries.
 - The installer MUST NOT store the service account token inside the
   repository working tree, in command history, in generated shell
   snippets, or in world-readable unit files.
-- The token SHALL be stored as an encrypted systemd credential when
-  supported, or as a root-owned file with mode `0600` inside
-  `CONFIG_DIR` as a portability fallback. The raw token SHALL NOT be
-  readable by the `IDENTIFIER` user other than through the installed
-  wrapper's controlled execution path.
-- `CONFIG_DIR` SHALL be owned by `root:root` with mode `0700`.
+- The token SHALL be stored either as an encrypted systemd
+  credential (opt-in) or as a file inside `CONFIG_DIR` with owner
+  `root:<IDENTIFIER>` and mode `0640` (default). Both modes
+  restrict read access to `root` and members of the `IDENTIFIER`
+  group; wider-than-group read access SHALL NOT be used. Members of
+  the `IDENTIFIER` group MAY read the token file directly — the
+  wrapper is the recommended access path, not a technical gate.
+- `CONFIG_DIR` SHALL be owned by `root:<IDENTIFIER>` with mode
+  `0750`.
 - The installed wrapper at
   `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` SHALL be owned by
   `root:<IDENTIFIER>` with mode `0750`.
@@ -565,8 +598,9 @@ Given all required inputs are present with `IDENTIFIER=openbrain`
 When `sudo -E ./create-1password-env-wrapper.sh` completes successfully
 
 Then the service account token is persisted using the configured
-`TOKEN_STORAGE_MODE` and is not readable by the `openbrain` user
-directly
+`TOKEN_STORAGE_MODE` and is readable only by `root` and members of
+the `openbrain` group (for `root-owned-file` mode: owner
+`root:openbrain`, mode `0640`)
 
 And `${INSTALL_PREFIX}/with-openbrain-env.sh` exists with owner
 `root:openbrain` and mode `0750`
