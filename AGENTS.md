@@ -7,9 +7,14 @@ deliberately does not duplicate it.
 ## What this repo is
 
 A self-contained installer for a command that runs arbitrary commands
-(or an interactive subshell) with environment variables loaded from a
-1Password Environment. The 1Password service account token is stored
-**only** as a systemd encrypted credential at
+(or an interactive subshell) with environment variables loaded from
+a **1Password Environment** (the developer beta feature —
+[docs](https://developer.1password.com/docs/environments)). Variables
+are read at wrapper runtime via `op run --environment <ENV-ID>`.
+The wrapper does **not** enumerate any 1Password vault.
+
+The 1Password service account token is stored **only** as a systemd
+encrypted credential at
 `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` —
 plaintext token files on disk are explicitly forbidden. The wrapper
 self-escalates via `sudo -n`, decrypts the credential with
@@ -18,24 +23,30 @@ self-escalates via `sudo -n`, decrypts the credential with
 a command line and never touches disk after decryption.
 
 A single `IDENTIFIER` value names the Linux user, Linux group,
-1Password vault, and 1Password Environment, and determines the
-wrapper command name `with-<IDENTIFIER>-env.sh`.
+wrapper command, and credential scope. The 1Password Environment
+itself is identified by a separate input,
+`ONEPASSWORD_ENVIRONMENT_ID`, copied from the 1Password desktop
+app: `Developer → View Environments → Manage environment → Copy
+environment ID`.
 
 ## Prerequisites
 
 - Linux host with **systemd** (`systemctl`, `systemd-creds`),
   `sudo` (GNU sudo, not `sudo-rs` — `-E` / `--preserve-env=` is
   required), and `setpriv` (`util-linux`)
-- The [1Password CLI](https://developer.1password.com/docs/cli/)
-  (`op`) installed and on `PATH`
-- `jq` installed and on `PATH` (used by the wrapper to enumerate
-  vault items)
+- The **1Password CLI beta** with Environments support
+  (`op` `2.33.0-beta.02` or later — verified working on
+  `2.35.0-beta.01`). Stable `op` 2.34.0 lacks the `op environment`
+  subcommand and `op run --environment` flag. Download:
+  <https://releases.1password.com/developers/cli-beta/>
 - An existing Linux **user** and **group** both named `IDENTIFIER`
-- An existing 1Password **vault** named `IDENTIFIER` whose items
-  represent the variables to inject — each item's title is the
-  environment variable name and the value lives in the item's
-  `credential` field
-- A 1Password service account token with read access to that vault
+- An existing 1Password **Environment** containing the variables
+  to inject (each Environment entry is a `KEY=value` pair). Copy
+  the Environment ID from the desktop app:
+  `Developer → View Environments → Manage environment → Copy
+  environment ID`
+- A 1Password **service account** token with read access to that
+  Environment
 
 ## Install the wrapper
 
@@ -48,6 +59,7 @@ argument (auditd / `auth.log` / journal log argv but not env):
 ```sh
   OP_SERVICE_ACCOUNT_TOKEN='ops_EXAMPLE_TOKEN_NOT_A_REAL_VALUE' \
    IDENTIFIER=openbrain \
+   ONEPASSWORD_ENVIRONMENT_ID='blgexucrwfr2dtsxe2q4uu7dp4' \
    sudo -E ./create-1password-env-wrapper.sh
 ```
 
@@ -139,19 +151,23 @@ The repository ships a Bats integration test at
 1. Make sure the host has `bats`, `bats-support`, `bats-assert`,
    `op`, `jq`, `sudo`, and the Linux user/group `openbrain`.
 2. Populate the gitignored bootstrap secret file `.env.local` at the
-   repository root with a real service account token. Starting from
-   the placeholder:
+   repository root with a real service account token AND the
+   Environment ID. Starting from placeholders:
 
    ```sh
-   printf 'OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=PLACEHOLDER\n' > .env.local
-   # then edit .env.local and replace PLACEHOLDER with the real token
+   {
+     printf 'OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=PLACEHOLDER\n'
+     printf 'OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=PLACEHOLDER\n'
+   } > .env.local
+   # then edit .env.local and replace each PLACEHOLDER with the real value
    ```
 
-   The test will fail fast if the file is missing or the token still
+   The test will fail fast if either entry is missing or still
    reads `PLACEHOLDER`.
-3. Make sure the 1Password vault `openbrain` contains an item titled
-   `TEST_CREDENTIAL` with a `credential` field equal to
-   `TEST_VALUE`.
+3. Make sure the 1Password Environment identified by
+   `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` contains
+   `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+   `TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`.
 4. From the repository root, run:
 
    ```sh

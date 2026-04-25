@@ -29,7 +29,7 @@ setup_file() {
 
     local env_file="$REPO_ROOT/.env.local"
     if [ ! -f "$env_file" ]; then
-        echo "FATAL: $env_file is missing. Populate it with OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>." >&2
+        echo "FATAL: $env_file is missing. Populate it with OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN and OPENBRAIN_1PASSWORD_ENVIRONMENT_ID." >&2
         return 1
     fi
     set -a
@@ -41,10 +41,18 @@ setup_file() {
         echo "FATAL: OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN is missing or PLACEHOLDER in $env_file." >&2
         return 1
     fi
+    if [ -z "${OPENBRAIN_1PASSWORD_ENVIRONMENT_ID:-}" ] \
+       || [ "$OPENBRAIN_1PASSWORD_ENVIRONMENT_ID" = "PLACEHOLDER" ]; then
+        echo "FATAL: OPENBRAIN_1PASSWORD_ENVIRONMENT_ID is missing or PLACEHOLDER in $env_file." >&2
+        return 1
+    fi
     BOOTSTRAP_TOKEN="$OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN"
-    export BOOTSTRAP_TOKEN
+    BOOTSTRAP_ENV_ID="$OPENBRAIN_1PASSWORD_ENVIRONMENT_ID"
+    export BOOTSTRAP_TOKEN BOOTSTRAP_ENV_ID
     unset OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN
+    unset OPENBRAIN_1PASSWORD_ENVIRONMENT_ID
     unset OP_SERVICE_ACCOUNT_TOKEN
+    unset ONEPASSWORD_ENVIRONMENT_ID
 
     STAGED_TARGET="$(mktemp /tmp/print-test-env-vars.XXXXXX.sh)"
     export STAGED_TARGET
@@ -62,26 +70,30 @@ setup() {
     load '/usr/lib/bats/bats-assert/load'
 }
 
-# Run the installer with the bootstrap token passed via env (NEVER argv).
-# The bash `VAR=value cmd ...` syntax exports VAR into cmd's environment
-# only; combined with `sudo -E`, the token is preserved into the sudo
-# child without appearing on the command line.
+# Run the installer with the bootstrap token + Environment ID passed
+# via env (NEVER argv). The bash `VAR=value cmd ...` syntax exports
+# VAR into cmd's environment only; combined with `sudo -E`, the token
+# is preserved into the sudo child without appearing on the command
+# line.
 run_installer() {
-    run env OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" IDENTIFIER=openbrain \
+    run env OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" \
+        IDENTIFIER=openbrain \
+        ONEPASSWORD_ENVIRONMENT_ID="$BOOTSTRAP_ENV_ID" \
         sudo -E -- "$INSTALLER"
 }
 
-# Run the installer WITHOUT the token (used to assert that missing-input
-# validation triggers and exits non-zero before any side effects).
+# Run the installer WITHOUT the token + Environment ID.
 run_installer_without_token() {
-    run env -u OP_SERVICE_ACCOUNT_TOKEN IDENTIFIER=openbrain \
+    run env -u OP_SERVICE_ACCOUNT_TOKEN -u ONEPASSWORD_ENVIRONMENT_ID \
+        IDENTIFIER=openbrain \
         sudo -E -- "$INSTALLER"
 }
 
-# Run the installer with a malformed IDENTIFIER (and a valid token, so
-# the test exercises only the regex-rejection path).
+# Run the installer with a malformed IDENTIFIER.
 run_installer_with_bad_identifier() {
-    run env OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" IDENTIFIER='Open_Brain' \
+    run env OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" \
+        IDENTIFIER='Open_Brain' \
+        ONEPASSWORD_ENVIRONMENT_ID="$BOOTSTRAP_ENV_ID" \
         sudo -E -- "$INSTALLER"
 }
 
@@ -142,11 +154,14 @@ run_installer_with_bad_identifier() {
     assert_success
 }
 
-@test "wrapper injects TEST_CREDENTIAL when running as openbrain" {
+@test "wrapper injects Environment values when running as openbrain" {
     [ -e "$INSTALLED_WRAPPER" ] || run_installer
     run sudo -u openbrain "$INSTALLED_WRAPPER" "$STAGED_TARGET"
     assert_success
-    assert_line "TEST_CREDENTIAL=TEST_VALUE"
+    assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE"
+    assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2"
+    # Regression guard: the wrapper SHALL NOT enumerate vault items.
+    refute_line --regexp '^TEST_CREDENTIAL_FROM_VAULT='
     refute_output --partial "OP_SERVICE_ACCOUNT_TOKEN="
 }
 
@@ -158,11 +173,12 @@ run_installer_with_bad_identifier() {
     [ "$output" = "$sorted" ]
 }
 
-@test "wrapper-spawned env shows TEST_CREDENTIAL but not OP_SERVICE_ACCOUNT_TOKEN" {
+@test "wrapper-spawned env shows Environment vars but not OP_SERVICE_ACCOUNT_TOKEN" {
     [ -e "$INSTALLED_WRAPPER" ] || run_installer
     run sudo -u openbrain "$INSTALLED_WRAPPER" env
     assert_success
-    assert_line "TEST_CREDENTIAL=TEST_VALUE"
+    assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE"
+    refute_line --regexp '^TEST_CREDENTIAL_FROM_VAULT='
     refute_line --regexp '^OP_SERVICE_ACCOUNT_TOKEN='
 }
 
@@ -190,6 +206,7 @@ run_installer_with_bad_identifier() {
     [ -x "$RENDERED_WRAPPER" ] || skip "rendered wrapper missing: $RENDERED_WRAPPER"
     run "$RENDERED_WRAPPER" "$STAGED_TARGET"
     assert_success
-    assert_line "TEST_CREDENTIAL=TEST_VALUE"
+    assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE"
+    refute_line --regexp '^TEST_CREDENTIAL_FROM_VAULT='
     refute_output --partial "OP_SERVICE_ACCOUNT_TOKEN="
 }

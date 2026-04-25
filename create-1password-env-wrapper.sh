@@ -29,10 +29,15 @@ command -v setpriv       >/dev/null 2>&1 || die "setpriv is required (install ut
 [ "$(id -u)" -eq 0 ] || die "must run as root; rerun under: sudo -E ./$PROG"
 
 # ---------------------------------------------------------------------------
-# Step 3: required tooling.
+# Step 3: required tooling. The wrapper reads variables from a 1Password
+# Environment, which requires an Environments-aware op build (introduced
+# in the 2.33.0-beta.02 line). Probe with `op environment --help` rather
+# than parsing version strings: if the subcommand is present, we are good.
 # ---------------------------------------------------------------------------
 command -v op >/dev/null 2>&1 || die "1Password CLI ('op') is not on PATH; install from https://developer.1password.com/docs/cli/"
-command -v jq >/dev/null 2>&1 || die "'jq' is not on PATH; install via your package manager (e.g. apt-get install jq)"
+if ! op environment --help >/dev/null 2>&1; then
+    die "the installed 'op' build does not support 1Password Environments (need 2.33.0-beta.02 or later from https://releases.1password.com/developers/cli-beta/ ; currently $(op --version 2>&1))"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 5: validate inputs.
@@ -46,6 +51,7 @@ DEFAULT_SHELL="${DEFAULT_SHELL:-/bin/bash}"
 missing=()
 [ -n "$IDENTIFIER" ] || missing+=("IDENTIFIER")
 [ -n "$OP_SERVICE_ACCOUNT_TOKEN" ] || missing+=("OP_SERVICE_ACCOUNT_TOKEN")
+[ -n "$ONEPASSWORD_ENVIRONMENT_ID" ] || missing+=("ONEPASSWORD_ENVIRONMENT_ID")
 if [ "${#missing[@]}" -gt 0 ]; then
     die "missing required input(s): ${missing[*]}"
 fi
@@ -73,7 +79,6 @@ INSTALLED_WRAPPER="${INSTALL_PREFIX}/${WRAPPER_BASENAME}"
 SYSTEMD_CRED_NAME="1password-env-wrapper-${IDENTIFIER}"
 SYSTEMD_CRED_PATH="/etc/credstore.encrypted/${SYSTEMD_CRED_NAME}"
 SUDOERS_FRAGMENT="/etc/sudoers.d/with-${IDENTIFIER}-env"
-RESOLVED_VAULT="${ONEPASSWORD_ENVIRONMENT_ID:-$IDENTIFIER}"
 
 render_wrapper() {
     local out="$1"
@@ -86,7 +91,7 @@ set -Eeuo pipefail
 
 readonly IDENTIFIER='${IDENTIFIER}'
 readonly DEFAULT_SHELL='${DEFAULT_SHELL}'
-readonly ONEPASSWORD_VAULT='${RESOLVED_VAULT}'
+readonly ONEPASSWORD_ENVIRONMENT_ID='${ONEPASSWORD_ENVIRONMENT_ID}'
 readonly SYSTEMD_CRED_NAME='${SYSTEMD_CRED_NAME}'
 readonly SYSTEMD_CRED_PATH='${SYSTEMD_CRED_PATH}'
 readonly INSTALLED_WRAPPER='${INSTALLED_WRAPPER}'
@@ -145,34 +150,19 @@ case "\${WRAPPER_STAGE:-0}" in
         ;;
     2)
         # Stage 2 — running as IDENTIFIER user with token in env.
+        # Inject variables from the 1Password Environment (NOT from
+        # any vault). The wrapper SHALL NOT call op item list,
+        # op item get, op read, or any other vault-touching op
+        # subcommand — only op run --environment.
         [ -n "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ] || die "stage 2 requires OP_SERVICE_ACCOUNT_TOKEN in env"
         unset OP_CONNECT_HOST OP_CONNECT_TOKEN
         export OP_CACHE=false
-
-        if ! items_json="\$(op item list --vault="\$ONEPASSWORD_VAULT" --format=json 2>&1)"; then
-            die "could not list items in 1Password vault '\$ONEPASSWORD_VAULT': \$items_json"
-        fi
-
-        work_dir="\$(mktemp -d)"
-        trap 'rm -rf -- "\$work_dir"' EXIT
-        env_file="\$work_dir/env-references"
-        : > "\$env_file"
-        chmod 0600 "\$env_file"
-
-        mapfile -t titles < <(printf '%s' "\$items_json" | jq -r '.[].title')
-        for title in "\${titles[@]}"; do
-            [ -n "\$title" ] || continue
-            if ! [[ "\$title" =~ ^[A-Za-z_][A-Za-z0-9_]*\$ ]]; then
-                die "1Password item title is not a valid POSIX env-var name: \$title"
-            fi
-            printf '%s=op://%s/%s/credential\n' "\$title" "\$ONEPASSWORD_VAULT" "\$title" >> "\$env_file"
-        done
 
         if [ "\$#" -eq 0 ]; then
             set -- "\$DEFAULT_SHELL" -i
         fi
 
-        exec op run --no-masking --env-file="\$env_file" -- \\
+        exec op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
             env -u OP_SERVICE_ACCOUNT_TOKEN -- "\$@"
         ;;
     *)
@@ -255,8 +245,8 @@ fi
 # (e.g. /home/ubuntu, which would belong to a non-root user and
 # trip op's "config dir not owned by current user" guard).
 if ! validation_output="$(HOME=/root OP_SERVICE_ACCOUNT_TOKEN="$validation_token" \
-        op item list --vault="$RESOLVED_VAULT" --format=json 2>&1)"; then
-    die "validation: 1Password could not list items in vault '$RESOLVED_VAULT': $validation_output"
+        op environment read "$ONEPASSWORD_ENVIRONMENT_ID" 2>&1)"; then
+    die "validation: 1Password could not read Environment '$ONEPASSWORD_ENVIRONMENT_ID': $validation_output"
 fi
 unset validation_token validation_output
 
@@ -286,4 +276,4 @@ ensure_gitignore_entry '.env.local'
 note "installed $INSTALLED_WRAPPER (root:$IDENTIFIER, mode 0750)"
 note "encrypted credential: $SYSTEMD_CRED_PATH"
 note "sudoers fragment:     $SUDOERS_FRAGMENT"
-note "1Password vault:      $RESOLVED_VAULT"
+note "1Password Environment ID: $ONEPASSWORD_ENVIRONMENT_ID"

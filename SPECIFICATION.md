@@ -33,17 +33,29 @@ implementation whenever this specification changes:
 This repository is a self-contained installer for a
 working-directory-agnostic wrapper command that runs arbitrary
 commands, or an interactive subshell, with environment variables
-loaded from a 1Password Environment. The installer renders the
-wrapper, stores the 1Password service account token **only** as an
-encrypted systemd credential under `/etc/credstore.encrypted/`, and
-installs the wrapper under `/usr/local/bin` for a dedicated Linux
-user.
+loaded from a **1Password Environment** — specifically the
+1Password developer "Environments" feature
+([docs](https://developer.1password.com/docs/environments)),
+*not* arbitrary items in a vault. Variables are read at wrapper
+runtime via `op run --environment <ENV-ID>`. The wrapper SHALL NOT
+enumerate items in any 1Password vault.
+
+The installer renders the wrapper, stores the 1Password service
+account token **only** as an encrypted systemd credential under
+`/etc/credstore.encrypted/`, and installs the wrapper under
+`/usr/local/bin` for a dedicated Linux user.
 
 The installer's only supported runtime target is **Linux with
 systemd**. Any plaintext-on-disk token storage (e.g. a root-owned
 `*.token` file under `/etc/`) is explicitly forbidden — outside of
 the gitignored `.env.local` bootstrap file at the repository root,
 the raw token SHALL never exist on disk.
+
+The 1Password CLI (`op`) MUST be a build that supports
+`op environment read` and `op run --environment` — these are the
+"1Password Environments" beta features introduced in the
+`2.33.0-beta.02` line. The earliest verified compatible build is
+`2.35.0-beta.01`.
 
 The installer is intended for VPS setup and ad-hoc maintenance work.
 It is not specific to Open Brain, although Open Brain is the first
@@ -59,19 +71,27 @@ reaches version control.
 
 ## The `IDENTIFIER` concept
 
-A single `IDENTIFIER` input names every coupled entity in the domain:
+A single `IDENTIFIER` input names the Linux/wrapper-side coupled
+entities:
 
 - the Linux **user** that runs the wrapper;
 - the Linux **group** that owns the wrapper binary so only its
   members may execute it (members of this group are also the
   operators allowed to invoke the wrapper without a sudo password
   prompt);
-- the 1Password **vault** holding the domain's secrets;
-- the 1Password **Environment** whose variables are injected;
 - the wrapper command name `with-<IDENTIFIER>-env.sh`;
 - the systemd encrypted credential name
   `1password-env-wrapper-<IDENTIFIER>` under
   `/etc/credstore.encrypted/`.
+
+The 1Password-side coupled entity — the **1Password Environment** —
+is identified by its **Environment ID** (a 1Password-assigned
+opaque string, copied via the 1Password desktop app:
+`Developer → View Environments → Manage environment → Copy
+environment ID`). The Environment ID is a *separate* required
+input, `ONEPASSWORD_ENVIRONMENT_ID`. There is no implicit "vault
+named after IDENTIFIER" linkage — the wrapper does not read
+vault items at runtime.
 
 `IDENTIFIER` SHALL match the regex `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`:
 lowercase letters, digits, and single hyphens; starting with a
@@ -80,8 +100,9 @@ reject values that do not match. Example values: `openbrain`,
 `acme-prod`.
 
 The installer SHALL NOT attempt to create the Linux user, the Linux
-group, the 1Password vault, or the 1Password Environment. All four
-SHALL already exist with the chosen identifier before installation.
+group, or the 1Password Environment. All three SHALL already exist
+before installation; the operator SHALL provide
+`ONEPASSWORD_ENVIRONMENT_ID` for the Environment.
 
 ## Repository Layout
 
@@ -113,28 +134,26 @@ All shell scripts in this repository SHALL:
    account token is the only bootstrap secret the VPS needs. Every
    other runtime secret is fetched from 1Password at wrapper
    execution time.
-2. **1Password Environment is the canonical env-var source.** The
-   wrapper SHALL inject variables from the 1Password Environment
-   named by `IDENTIFIER`. A variable's name in the Environment SHALL
-   be the environment variable name seen by the child process.
-3. **Vault access is scoped but not enumerated by default.** The
-   associated 1Password vault (also named by `IDENTIFIER`) SHALL hold
-   only secrets relevant to the same operational domain, but the
-   wrapper's v1 behaviour SHALL NOT enumerate arbitrary vault items
-   into environment variables. Vault item projection MAY be added
-   later under an explicit naming convention.
+2. **The 1Password Environment is the canonical env-var source.**
+   The wrapper SHALL inject variables from the 1Password
+   Environment whose ID is `ONEPASSWORD_ENVIRONMENT_ID` via
+   `op run --environment <id> -- <child>`. A variable's name in the
+   Environment SHALL be the environment variable name seen by the
+   child process. The wrapper SHALL NOT read any 1Password vault,
+   item, or secret reference outside of what the Environments
+   feature itself resolves.
+3. **No vault-item projection.** The wrapper SHALL NOT enumerate or
+   project vault items into environment variables, regardless of
+   whether a vault with the same name as `IDENTIFIER` exists. Vault
+   contents are not part of this contract.
 4. **No plaintext secrets on disk.** Outside of the gitignored
    `.env.local` bootstrap file at the repository root, the raw
    service account token SHALL never exist on disk. The installer
    and the wrapper MUST NOT write fetched 1Password Environment
    variables to `.env`, `.env.local`, shell profile files, or any
-   other file on disk. The wrapper SHALL pass Environment values to
-   the child process directly in memory, using whatever injection
-   mechanism the current `op` CLI provides (for example
-   `op run --env-file=<path>` reading from a process substitution,
-   or an equivalent subcommand). The implementer is expected to
-   consult the 1Password CLI documentation and pick the simplest
-   mechanism that satisfies this principle.
+   other file on disk. Variables flow from `op run --environment`'s
+   internal channel directly into the child process; no
+   intermediate file is created.
 5. **Token storage is the systemd encrypted credential, only.** The
    service account token SHALL be persisted exclusively as a
    systemd encrypted credential at
@@ -183,16 +202,19 @@ input if any required input is absent.
 ### Required Inputs
 
 - `IDENTIFIER` — shared name for the Linux user, Linux group,
-  1Password vault, 1Password Environment, wrapper command, and token
-  scope. MUST match the regex defined in "The `IDENTIFIER` concept".
-- `OP_SERVICE_ACCOUNT_TOKEN` — token for a 1Password service account
-  with read access to the Environment named by `IDENTIFIER`.
+  wrapper command, and credential scope. MUST match the regex
+  defined in "The `IDENTIFIER` concept".
+- `OP_SERVICE_ACCOUNT_TOKEN` — token for a 1Password service
+  account with read access to the 1Password Environment identified
+  by `ONEPASSWORD_ENVIRONMENT_ID`.
+- `ONEPASSWORD_ENVIRONMENT_ID` — opaque ID of the 1Password
+  Environment. Obtain via the desktop app:
+  `Developer → View Environments → Manage environment → Copy
+  environment ID`. Resolution by name is **not** supported (the
+  CLI's `op environment` subcommand has only `read`, no `list`).
 
 ### Optional Inputs
 
-- `ONEPASSWORD_ENVIRONMENT_ID` — explicit 1Password Environment ID.
-  If omitted, the installer MAY resolve the Environment by name
-  (`IDENTIFIER`) using the 1Password CLI.
 - `INSTALL_PREFIX` — directory for the installed wrapper. Default:
   `/usr/local/bin`.
 - `DEFAULT_SHELL` — shell to execute when the wrapper is invoked
@@ -202,8 +224,9 @@ There is no `TOKEN_STORAGE_MODE` knob: token storage is always the
 systemd encrypted credential at
 `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`.
 There is no `CONFIG_DIR`: nothing other than the encrypted
-credential needs to be persisted on disk; identifier, vault, and
-shell are baked into the rendered wrapper at install time.
+credential needs to be persisted on disk; identifier,
+Environment ID, and default shell are baked into the rendered
+wrapper at install time.
 
 Nothing else in the wrapper's identity is configurable: the installer
 always renders and installs `with-<IDENTIFIER>-env.sh`.
@@ -218,12 +241,14 @@ The installer SHALL, in order:
    return successfully.
 2. Verify it is running as `uid 0`; exit non-zero with guidance to
    rerun under `sudo` otherwise.
-3. Verify `op`, `jq`, and `setpriv` are installed and on `PATH`
-   (`op --version`, `jq --version`, `setpriv --version` succeed).
-   The installer SHALL NOT attempt a stricter semantic-version
-   check on `op`; if the installed `op` lacks a feature the wrapper
-   needs, the wrapper's own invocation will surface that at
-   validation time.
+3. Verify `op` and `setpriv` are installed and on `PATH`
+   (`op --version`, `setpriv --version` succeed). Additionally,
+   verify the installed `op` supports the Environments feature by
+   asserting that `op environment --help` exits successfully (the
+   `environment` subcommand was introduced in the `2.33.0-beta.02`
+   line). If the check fails, exit non-zero with a clear message
+   instructing the operator to install the `op` beta from
+   <https://releases.1password.com/developers/cli-beta/>.
 4. Verify the Linux user `IDENTIFIER` and the Linux group
    `IDENTIFIER` both exist.
 5. Validate all required inputs, including the `IDENTIFIER` regex.
@@ -232,9 +257,10 @@ The installer SHALL, in order:
    values.
 6. Render the wrapper to `./with-<IDENTIFIER>-env.sh` at the
    repository root with mode `0755`, baking in the resolved
-   `IDENTIFIER`, vault name, encrypted-credential name, installed
-   path, and `DEFAULT_SHELL`. This file is the gitignored build
-   artifact an operator can inspect before install.
+   `IDENTIFIER`, `ONEPASSWORD_ENVIRONMENT_ID`,
+   encrypted-credential name, installed path, and `DEFAULT_SHELL`.
+   This file is the gitignored build artifact an operator can
+   inspect before install.
 7. Encrypt the service account token via `systemd-creds encrypt`
    into `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
    atomically (write a sibling temp file in the same directory,
@@ -338,17 +364,15 @@ covers all three:
    - `unset OP_CONNECT_HOST OP_CONNECT_TOKEN` so 1Password Connect
      does not override `OP_SERVICE_ACCOUNT_TOKEN`;
    - export `OP_CACHE=false`;
-   - enumerate the items in the 1Password vault named by
-     `IDENTIFIER` (e.g. `op item list --vault=<IDENTIFIER>
-     --format=json | jq …`), validate each item title is a POSIX
-     env-var name (`^[A-Za-z_][A-Za-z0-9_]*$`), and write a
-     transient env-file of `op://<vault>/<title>/credential`
-     references into a private `mktemp -d` directory cleaned up on
-     exit;
-   - exec `op run --no-masking --env-file=<that file> -- env -u
-     OP_SERVICE_ACCOUNT_TOKEN -- <command>` so the final child
-     never sees the token;
+   - exec `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
+     -- env -u OP_SERVICE_ACCOUNT_TOKEN -- <command>` so the final
+     child never sees the service-account token;
    - when no command was supplied, run `DEFAULT_SHELL -i` instead.
+
+The wrapper SHALL NOT call `op item list`, `op item get`, `op read`,
+or any other vault-touching operation. Variables come from the
+1Password Environment exclusively, via the single
+`op run --environment` invocation above.
 
 The wrapper SHALL fail closed with a non-zero exit code and an error
 message (but no secret values) when:
@@ -357,7 +381,8 @@ message (but no secret values) when:
   fails;
 - `sudo -n` escalation fails (the operator is not in the
   `IDENTIFIER` group, or the sudoers fragment is missing);
-- the Environment ID cannot be resolved;
+- the configured Environment ID cannot be resolved by
+  `op run --environment`;
 - the service account token cannot read the Environment;
 - `op`'s injection mechanism returns a non-zero exit status before
   the child command runs.
@@ -422,16 +447,21 @@ Required properties:
 - Format: a plain `KEY=VALUE` file, one entry per line, no quoting,
   no surrounding whitespace, no inline comments. Lines beginning with
   `#` and blank lines are permitted.
-- Naming convention for tokens: one entry per supported identifier
-  of the form
-  `<IDENTIFIER_UPPERCASE>_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>`,
+- Naming convention: two entries per supported identifier:
+  `<IDENTIFIER_UPPERCASE>_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>`
+  and
+  `<IDENTIFIER_UPPERCASE>_1PASSWORD_ENVIRONMENT_ID=<env-id>`,
   where `<IDENTIFIER_UPPERCASE>` is the identifier in upper case
   with any hyphens replaced by underscores. For the default
-  identifier `openbrain`, the entry is
-  `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>`.
-- When a fresh clone ships a placeholder value (`PLACEHOLDER`),
-  consumers SHALL treat that as "not yet configured" and refuse to
-  proceed until a real token has been pasted in by the operator.
+  identifier `openbrain`, the entries are:
+  ```
+  OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>
+  OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=<env-id>
+  ```
+- When a fresh clone ships placeholder values (`PLACEHOLDER`),
+  consumers SHALL treat those as "not yet configured" and refuse
+  to proceed until real values have been pasted in by the
+  operator.
 
 Consumers of `.env.local` (the integration test; any future
 developer-mode runner) SHALL read it directly (for example via
@@ -449,33 +479,40 @@ acceptance scenarios in this specification.
 The test SHALL use the identifier `openbrain` and assume that:
 
 - a Linux user and group `openbrain` exist on the host;
-- a 1Password service account, vault, and Environment all named
-  `openbrain` exist;
-- that Environment contains at least the variable
-  `TEST_CREDENTIAL=TEST_VALUE`;
-- `.env.local` at the repository root contains
-  `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>`;
-- the host provides `bats`, `op`, `jq`, `sudo`, `setpriv`, the
-  systemd userspace (`systemctl`, `systemd-creds`), and the BATS
-  support libraries `bats-support` and `bats-assert` (or
-  equivalents) available on `PATH` or via `load`.
+- a 1Password service account exists with read access to a
+  1Password Environment (the Environment's name is irrelevant to
+  the wrapper; only its ID is used);
+- that Environment contains the variables
+  `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+  `TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`;
+- `.env.local` at the repository root contains both
+  `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>` and
+  `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=<env id>`;
+- the host provides `bats`, an Environments-aware `op` build
+  (`2.33.0-beta.02`+), `sudo` (GNU sudo, with env-preservation),
+  `setpriv`, the systemd userspace (`systemctl`,
+  `systemd-creds`), and the BATS support libraries `bats-support`
+  and `bats-assert` (or equivalents) available on `PATH` or via
+  `load`.
 
 ### Behavior
 
 The test file SHALL:
 
 1. In `setup_file` (or equivalent), load `.env.local`, fail fast if
-   the file is missing or if
-   `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN` is absent or equals
-   `PLACEHOLDER`, and export the token as `OP_SERVICE_ACCOUNT_TOKEN`
-   only for installer invocations (not as a global test-process
-   env var).
-2. Invoke the installer under `sudo -E` with `IDENTIFIER=openbrain`,
-   capturing stdout, stderr, and exit status. Assert exit status
-   `0`, that the installer reported installing
-   `/usr/local/bin/with-openbrain-env.sh`, and that the installer
-   output contains neither the raw token value nor the placeholder
-   string.
+   the file is missing or if either
+   `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN` or
+   `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` is absent or equals
+   `PLACEHOLDER`, and pass the token (as `OP_SERVICE_ACCOUNT_TOKEN`)
+   and the Environment ID (as `ONEPASSWORD_ENVIRONMENT_ID`) into
+   each installer invocation only — not as global test-process env
+   vars.
+2. Invoke the installer under `sudo -E` with `IDENTIFIER=openbrain`
+   and `ONEPASSWORD_ENVIRONMENT_ID` set, capturing stdout, stderr,
+   and exit status. Assert exit status `0`, that the installer
+   reported installing `/usr/local/bin/with-openbrain-env.sh`, and
+   that the installer output contains neither the raw token value
+   nor the placeholder string.
 3. Assert that `/usr/local/bin/with-openbrain-env.sh` exists, is
    owned by `root:openbrain`, and has mode `0750`.
 4. Assert that the encrypted credential file
@@ -499,12 +536,18 @@ The test file SHALL:
    wrapper against that staged path, and remove the staged copy on
    teardown. Assert:
    - exit status `0`;
-   - the output contains exactly the line `TEST_CREDENTIAL=TEST_VALUE`;
+   - the output contains the lines
+     `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+     `TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`;
+   - the output does **not** contain any line starting with
+     `TEST_CREDENTIAL_FROM_VAULT=` (this guards against
+     regressing back to the vault-enumeration model);
    - the output is sorted by variable name;
    - the output contains no `OP_SERVICE_ACCOUNT_TOKEN=` line.
 8. Run the installed wrapper as the `openbrain` user with the
-   command `env`; assert `TEST_CREDENTIAL=TEST_VALUE` appears in
-   the output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
+   command `env`; assert
+   `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` appears in the
+   output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
 9. Run the installed wrapper as the `openbrain` user with the
    command `printenv OP_SERVICE_ACCOUNT_TOKEN` and assert the
    wrapper exit status is `1` (variable unset), confirming that the
@@ -512,11 +555,11 @@ The test file SHALL:
 10. Run the **rendered** build artifact at the repository root
     (`./with-openbrain-env.sh`) directly as the BATS-invoking user
     (with the staged `print-test-env-vars.sh` as the argument) and
-    assert it succeeds and produces `TEST_CREDENTIAL=TEST_VALUE`.
-    This proves stage-0 self-escalation via the sudoers fragment
-    works end-to-end for the operator who just ran the installer
-    (whose user was added to the `openbrain` group in installer
-    step 10).
+    assert it succeeds and produces
+    `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE`. This proves
+    stage-0 self-escalation via the sudoers fragment works
+    end-to-end for the operator who just ran the installer (whose
+    user was added to the `openbrain` group in installer step 10).
 
 The test SHALL be idempotent: rerunning it SHALL succeed whether or
 not a prior install exists. The test SHOULD NOT remove the installed
@@ -542,15 +585,20 @@ prepared to enter their password at the first escalation.
 
 1. **What this repo is** — one short paragraph.
 2. **Prerequisites** — Linux host with `systemd` (for encrypted
-   credentials), `sudo`, the 1Password CLI (`op`) installed and on
-   `PATH`, an existing Linux user and group both named `IDENTIFIER`,
-   an existing 1Password vault and Environment both named
-   `IDENTIFIER`, and a 1Password service account token with read
-   access to that Environment.
+   credentials), `sudo` (GNU, with env-preservation), the
+   Environments-aware 1Password CLI (`op` `2.33.0-beta.02`+)
+   installed and on `PATH`, an existing Linux user and group both
+   named `IDENTIFIER`, an existing 1Password Environment, and a
+   1Password service account token with read access to that
+   Environment.
 3. **Installing the wrapper** — exact commands to run
    `sudo -E ./create-1password-env-wrapper.sh`, including how to
-   supply `IDENTIFIER` and `OP_SERVICE_ACCOUNT_TOKEN` without
-   recording the token in shell history.
+   supply `IDENTIFIER`, `OP_SERVICE_ACCOUNT_TOKEN`, and
+   `ONEPASSWORD_ENVIRONMENT_ID` without recording the token in
+   shell history. Document how to obtain
+   `ONEPASSWORD_ENVIRONMENT_ID` via the 1Password desktop app
+   (`Developer → View Environments → Manage environment → Copy
+   environment ID`).
 4. **Running a command via the wrapper** — exact commands for the
    arbitrary-command form, as the `IDENTIFIER` user.
 5. **Opening an interactive shell via the wrapper** — exact command
@@ -643,13 +691,14 @@ SHALL NOT rewrite, reorder, or remove any other `.gitignore` entries.
 ### Scenario: Installer refuses missing inputs
 
 Given `./create-1password-env-wrapper.sh` is invoked under `sudo`
-without `OP_SERVICE_ACCOUNT_TOKEN` set, with `IDENTIFIER=openbrain`
+without `OP_SERVICE_ACCOUNT_TOKEN` *or* `ONEPASSWORD_ENVIRONMENT_ID`
+set, with `IDENTIFIER=openbrain`
 
 When the installer validates its inputs
 
 Then it exits non-zero before creating or modifying any files
 
-And it reports the missing input name
+And it reports each missing input name
 
 And it does not print any secret values
 
@@ -715,10 +764,13 @@ When `openbrain` runs
 `with-openbrain-env.sh /absolute/path/to/print-test-env-vars.sh`
 
 Then `print-test-env-vars.sh` runs with every variable from the
-1Password Environment available
+1Password **Environment** (NOT the vault) available
 
 And the output contains every `TEST_*` variable defined in the
 Environment, in `NAME=value` form, sorted by name
+
+And the output does NOT contain any variable that exists only as a
+vault item (proving the wrapper does not enumerate vault items)
 
 And the command does not receive `OP_SERVICE_ACCOUNT_TOKEN`
 
@@ -765,18 +817,28 @@ And no plaintext token has been persisted to disk
 ### Scenario: BATS integration test proves the happy path
 
 Given `.env.local` at the repository root contains a real
-`OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN` (not `PLACEHOLDER`)
+`OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN` and a real
+`OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` (neither equal to
+`PLACEHOLDER`)
 
 And the `openbrain` Linux user and group exist
 
-And the 1Password Environment `openbrain` contains `TEST_CREDENTIAL=TEST_VALUE`
+And the 1Password Environment identified by
+`OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` contains
+`TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+`TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`
 
 When the operator runs `bats test/integration.bats`
 
 Then the installer completes successfully with `IDENTIFIER=openbrain`
 
-And the installed wrapper injects `TEST_CREDENTIAL=TEST_VALUE` into
-the child process invoked against `print-test-env-vars.sh`
+And the installed wrapper injects
+`TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+`TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2` into the child
+process invoked against `print-test-env-vars.sh`
+
+And the wrapper does NOT inject any vault-only variable (e.g. it
+does not produce `TEST_CREDENTIAL_FROM_VAULT=…`)
 
 And `OP_SERVICE_ACCOUNT_TOKEN` is not present in the child process
 
