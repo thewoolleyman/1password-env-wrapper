@@ -2,6 +2,13 @@
 
 # Integration test for the 1Password Environment Wrapper Factory.
 # See SPECIFICATION.md, section "Integration Test: test/integration.bats".
+#
+# Token-handling rule: the bootstrap token is loaded into a *local* shell
+# variable inside setup_file and is *only* passed to subprocesses via
+# `OP_SERVICE_ACCOUNT_TOKEN=$var sudo -E -- ...` (bash local-env prefix +
+# sudo --preserve-env), which keeps the token in the env block but off
+# the command line, so /var/log/auth.log and the systemd journal cannot
+# capture it.
 
 setup_file() {
     load '/usr/lib/bats/bats-support/load'
@@ -13,19 +20,24 @@ setup_file() {
     export INSTALLER
     INSTALLED_WRAPPER="/usr/local/bin/with-openbrain-env.sh"
     export INSTALLED_WRAPPER
+    RENDERED_WRAPPER="$REPO_ROOT/with-openbrain-env.sh"
+    export RENDERED_WRAPPER
+    CRED_PATH="/etc/credstore.encrypted/1password-env-wrapper-openbrain"
+    export CRED_PATH
+    SUDOERS_PATH="/etc/sudoers.d/with-openbrain-env"
+    export SUDOERS_PATH
 
     local env_file="$REPO_ROOT/.env.local"
     if [ ! -f "$env_file" ]; then
         echo "FATAL: $env_file is missing. Populate it with OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>." >&2
         return 1
     fi
-    # shellcheck disable=SC1090
     set -a
     # shellcheck source=/dev/null
     source "$env_file"
     set +a
-    if [ -z "${OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN:-}" ] || \
-       [ "$OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN" = "PLACEHOLDER" ]; then
+    if [ -z "${OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN:-}" ] \
+       || [ "$OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN" = "PLACEHOLDER" ]; then
         echo "FATAL: OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN is missing or PLACEHOLDER in $env_file." >&2
         return 1
     fi
@@ -50,23 +62,38 @@ setup() {
     load '/usr/lib/bats/bats-assert/load'
 }
 
+# Run the installer with the bootstrap token passed via env (NEVER argv).
+# The bash `VAR=value cmd ...` syntax exports VAR into cmd's environment
+# only; combined with `sudo -E`, the token is preserved into the sudo
+# child without appearing on the command line.
 run_installer() {
-    run sudo --preserve-env=IDENTIFIER,OP_SERVICE_ACCOUNT_TOKEN \
-        env IDENTIFIER=openbrain OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" \
-        "$INSTALLER"
+    run env OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" IDENTIFIER=openbrain \
+        sudo -E -- "$INSTALLER"
+}
+
+# Run the installer WITHOUT the token (used to assert that missing-input
+# validation triggers and exits non-zero before any side effects).
+run_installer_without_token() {
+    run env -u OP_SERVICE_ACCOUNT_TOKEN IDENTIFIER=openbrain \
+        sudo -E -- "$INSTALLER"
+}
+
+# Run the installer with a malformed IDENTIFIER (and a valid token, so
+# the test exercises only the regex-rejection path).
+run_installer_with_bad_identifier() {
+    run env OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" IDENTIFIER='Open_Brain' \
+        sudo -E -- "$INSTALLER"
 }
 
 @test "installer rejects missing OP_SERVICE_ACCOUNT_TOKEN" {
-    run sudo --preserve-env=IDENTIFIER env IDENTIFIER=openbrain "$INSTALLER"
+    run_installer_without_token
     assert_failure
     assert_output --partial "OP_SERVICE_ACCOUNT_TOKEN"
     refute_output --partial "$BOOTSTRAP_TOKEN"
 }
 
 @test "installer rejects malformed IDENTIFIER" {
-    run sudo --preserve-env=IDENTIFIER,OP_SERVICE_ACCOUNT_TOKEN \
-        env IDENTIFIER=Open_Brain OP_SERVICE_ACCOUNT_TOKEN="$BOOTSTRAP_TOKEN" \
-        "$INSTALLER"
+    run_installer_with_bad_identifier
     assert_failure
     assert_output --partial "IDENTIFIER"
     refute_output --partial "$BOOTSTRAP_TOKEN"
@@ -75,7 +102,7 @@ run_installer() {
 @test "installer succeeds with valid inputs" {
     run_installer
     assert_success
-    assert_output --partial "/usr/local/bin/with-openbrain-env.sh"
+    assert_output --partial "$INSTALLED_WRAPPER"
     refute_output --partial "$BOOTSTRAP_TOKEN"
     refute_output --partial "PLACEHOLDER"
 }
@@ -85,6 +112,27 @@ run_installer() {
     assert [ -e "$INSTALLED_WRAPPER" ]
     run stat -c '%U:%G %a' "$INSTALLED_WRAPPER"
     assert_output "root:openbrain 750"
+}
+
+@test "encrypted credential exists with correct ownership and mode" {
+    [ -e "$CRED_PATH" ] || run_installer
+    run sudo stat -c '%U:%G %a' "$CRED_PATH"
+    assert_output "root:root 600"
+}
+
+@test "no plaintext token directory exists" {
+    # The whole /etc/onepassword-env-wrapper/ tree from the old
+    # root-owned-file design must not exist on disk anymore.
+    run sudo test -e /etc/onepassword-env-wrapper
+    assert_failure
+}
+
+@test "sudoers fragment is installed and well-formed" {
+    [ -e "$SUDOERS_PATH" ] || run_installer
+    run sudo stat -c '%U:%G %a' "$SUDOERS_PATH"
+    assert_output "root:root 440"
+    run sudo cat "$SUDOERS_PATH"
+    assert_output "%openbrain ALL=(root) NOPASSWD: SETENV: $INSTALLED_WRAPPER"
 }
 
 @test ".gitignore contains required entries" {
@@ -129,4 +177,19 @@ run_installer() {
     assert_success
     run_installer
     assert_success
+}
+
+@test "rendered wrapper at repo root works for the installing operator" {
+    # The build artifact at $REPO_ROOT/with-openbrain-env.sh is mode
+    # 0755 per installer step 6 and stage-0 self-escalates via
+    # `sudo -n` to the *installed* wrapper. The installer also added
+    # $SUDO_USER to the openbrain group during step 10 — combined with
+    # the sudoers fragment from step 9, the BATS-invoking user
+    # therefore SHALL be able to run the rendered wrapper directly.
+    [ -e "$INSTALLED_WRAPPER" ] || run_installer
+    [ -x "$RENDERED_WRAPPER" ] || skip "rendered wrapper missing: $RENDERED_WRAPPER"
+    run "$RENDERED_WRAPPER" "$STAGED_TARGET"
+    assert_success
+    assert_line "TEST_CREDENTIAL=TEST_VALUE"
+    refute_output --partial "OP_SERVICE_ACCOUNT_TOKEN="
 }

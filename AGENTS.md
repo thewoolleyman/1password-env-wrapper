@@ -9,11 +9,13 @@ deliberately does not duplicate it.
 A self-contained installer for a command that runs arbitrary commands
 (or an interactive subshell) with environment variables loaded from a
 1Password Environment. The 1Password service account token is stored
-either as a group-readable file under `/etc/onepassword-env-wrapper/`
-(default) or as a systemd encrypted credential (advanced opt-in).
-Only `root` and members of the `IDENTIFIER` group can read the
-token; the wrapper is the recommended access path, not a technical
-gate.
+**only** as a systemd encrypted credential at
+`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` —
+plaintext token files on disk are explicitly forbidden. The wrapper
+self-escalates via `sudo -n`, decrypts the credential with
+`systemd-creds`, then drops privileges via `setpriv` to the
+`IDENTIFIER` user before invoking `op`. The token never appears on
+a command line and never touches disk after decryption.
 
 A single `IDENTIFIER` value names the Linux user, Linux group,
 1Password vault, and 1Password Environment, and determines the
@@ -21,8 +23,9 @@ wrapper command name `with-<IDENTIFIER>-env.sh`.
 
 ## Prerequisites
 
-- Linux host with `sudo` (and `systemd` only if you opt into
-  `TOKEN_STORAGE_MODE=systemd-credential`)
+- Linux host with **systemd** (`systemctl`, `systemd-creds`),
+  `sudo` (GNU sudo, not `sudo-rs` — `-E` / `--preserve-env=` is
+  required), and `setpriv` (`util-linux`)
 - The [1Password CLI](https://developer.1password.com/docs/cli/)
   (`op`) installed and on `PATH`
 - `jq` installed and on `PATH` (used by the wrapper to enumerate
@@ -36,34 +39,48 @@ wrapper command name `with-<IDENTIFIER>-env.sh`.
 
 ## Install the wrapper
 
-Run the installer from the repository root under `sudo`. Put a leading
-space on the command so most shells skip history (requires
-`HISTCONTROL=ignorespace` or `ignoreboth`), and use `sudo -E` so the
-token env var reaches the installer:
+Run the installer from the repository root under `sudo -E`. Put a
+leading space on the command so most shells skip history (requires
+`HISTCONTROL=ignorespace` or `ignoreboth`), and pass the token as a
+**bash local-env prefix** so it never appears on a command-line
+argument (auditd / `auth.log` / journal log argv but not env):
 
 ```sh
- sudo -E env \
+  OP_SERVICE_ACCOUNT_TOKEN='ops_EXAMPLE_TOKEN_NOT_A_REAL_VALUE' \
    IDENTIFIER=openbrain \
-   OP_SERVICE_ACCOUNT_TOKEN='ops_EXAMPLE_TOKEN_NOT_A_REAL_VALUE' \
-   ./create-1password-env-wrapper.sh
+   sudo -E ./create-1password-env-wrapper.sh
 ```
 
 Optional inputs (see `SPECIFICATION.md` for defaults and full list):
 
 - `ONEPASSWORD_ENVIRONMENT_ID`
 - `INSTALL_PREFIX` (default `/usr/local/bin`)
-- `CONFIG_DIR` (default `/etc/onepassword-env-wrapper`)
-- `TOKEN_STORAGE_MODE` (`systemd-credential` or `root-owned-file`)
 - `DEFAULT_SHELL` (default `/bin/bash`)
 
-The installer renders the wrapper to `./with-<IDENTIFIER>-env.sh` at
-the repository root (gitignored, inspect it before it is copied
-in), persists the token under `CONFIG_DIR` as
-`<IDENTIFIER>.token` (owner `root:<IDENTIFIER>`, mode `0640`),
-installs the wrapper at
+There is **no** `TOKEN_STORAGE_MODE` knob — token storage is always
+the systemd encrypted credential. There is no `CONFIG_DIR` either:
+the installer no longer writes any plaintext file under `/etc/`.
+
+The installer renders the wrapper to `./with-<IDENTIFIER>-env.sh`
+at the repository root (gitignored, inspect it before it is copied
+in), encrypts the token via `systemd-creds encrypt` into
+`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
+(owner `root:root`, mode `0600`), installs the wrapper at
 `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` with owner
-`root:<IDENTIFIER>` and mode `0750`, and ensures `.gitignore`
-contains both `/with-*-env.sh` and `.env.local`.
+`root:<IDENTIFIER>` and mode `0750`, drops a sudoers fragment at
+`/etc/sudoers.d/with-<IDENTIFIER>-env` granting `%<IDENTIFIER>`
+passwordless `sudo` for that one wrapper, adds `$SUDO_USER` to
+the `<IDENTIFIER>` group, and ensures `.gitignore` contains both
+`/with-*-env.sh` and `.env.local`.
+
+After the installer completes, your existing shell does not yet
+reflect the new group membership — but `sudo` evaluates
+`/etc/group` on every invocation, so the wrapper's stage-0
+`sudo -n` self-escalation works immediately. To get `with-…-env.sh`
+into your interactive shell's idea of "my groups" (so for example
+the wrapper's setgid bit on `0750` doesn't trip `[ -x ]` for
+adjacent tooling), start a new login session or `exec sg
+<IDENTIFIER> bash`.
 
 ## Run a command via the wrapper
 
@@ -106,10 +123,12 @@ sorted by name, in `NAME=value` form.
 ## Rotate the service account token
 
 Rerun the installer with the replacement
-`OP_SERVICE_ACCOUNT_TOKEN` and the same `IDENTIFIER`. The stored
-credential or token file, and the rendered/installed wrapper, are
-replaced atomically. No fetched Environment values are persisted to
-disk.
+`OP_SERVICE_ACCOUNT_TOKEN` and the same `IDENTIFIER`. The encrypted
+credential at
+`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` and
+the rendered/installed wrapper are replaced atomically. No fetched
+Environment values, and no plaintext token, are persisted to disk
+at any point.
 
 ## Running the integration test
 
@@ -153,13 +172,14 @@ is an obvious placeholder.
 ```console
 admin@vps:~/projects/1password-env-wrapper$ whoami
 admin
-admin@vps:~/projects/1password-env-wrapper$  sudo -E env \
->    IDENTIFIER=openbrain \
->    OP_SERVICE_ACCOUNT_TOKEN='ops_EXAMPLE_TOKEN_NOT_A_REAL_VALUE' \
->    ./create-1password-env-wrapper.sh
-validated 1Password access for Environment "openbrain"
-stored token as encrypted systemd credential 1password-env-wrapper-openbrain
+admin@vps:~/projects/1password-env-wrapper$ OP_SERVICE_ACCOUNT_TOKEN='ops_EXAMPLE_TOKEN_NOT_A_REAL_VALUE' \
+>   IDENTIFIER=openbrain \
+>   sudo -E ./create-1password-env-wrapper.sh
+added admin to group openbrain (next sudo invocation picks this up)
 installed /usr/local/bin/with-openbrain-env.sh (root:openbrain, mode 0750)
+encrypted credential: /etc/credstore.encrypted/1password-env-wrapper-openbrain
+sudoers fragment:     /etc/sudoers.d/with-openbrain-env
+1Password vault:      openbrain
 admin@vps:~/projects/1password-env-wrapper$ sudo -iu openbrain
 openbrain@vps:~$ with-openbrain-env.sh /home/admin/projects/1password-env-wrapper/print-test-env-vars.sh
 TEST_BAR=world

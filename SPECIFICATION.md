@@ -34,10 +34,16 @@ This repository is a self-contained installer for a
 working-directory-agnostic wrapper command that runs arbitrary
 commands, or an interactive subshell, with environment variables
 loaded from a 1Password Environment. The installer renders the
-wrapper, stores the 1Password service account token as an encrypted
-systemd credential (or, as a portability fallback, a root-owned token
-file), and installs the wrapper under `/usr/local/bin` for a dedicated
-Linux user.
+wrapper, stores the 1Password service account token **only** as an
+encrypted systemd credential under `/etc/credstore.encrypted/`, and
+installs the wrapper under `/usr/local/bin` for a dedicated Linux
+user.
+
+The installer's only supported runtime target is **Linux with
+systemd**. Any plaintext-on-disk token storage (e.g. a root-owned
+`*.token` file under `/etc/`) is explicitly forbidden — outside of
+the gitignored `.env.local` bootstrap file at the repository root,
+the raw token SHALL never exist on disk.
 
 The installer is intended for VPS setup and ad-hoc maintenance work.
 It is not specific to Open Brain, although Open Brain is the first
@@ -57,12 +63,15 @@ A single `IDENTIFIER` input names every coupled entity in the domain:
 
 - the Linux **user** that runs the wrapper;
 - the Linux **group** that owns the wrapper binary so only its
-  members may execute it;
+  members may execute it (members of this group are also the
+  operators allowed to invoke the wrapper without a sudo password
+  prompt);
 - the 1Password **vault** holding the domain's secrets;
 - the 1Password **Environment** whose variables are injected;
 - the wrapper command name `with-<IDENTIFIER>-env.sh`;
-- the token storage scope (credential name or filename) under
-  `CONFIG_DIR`.
+- the systemd encrypted credential name
+  `1password-env-wrapper-<IDENTIFIER>` under
+  `/etc/credstore.encrypted/`.
 
 `IDENTIFIER` SHALL match the regex `^[a-z][a-z0-9-]{0,30}[a-z0-9]$`:
 lowercase letters, digits, and single hyphens; starting with a
@@ -114,30 +123,44 @@ All shell scripts in this repository SHALL:
    wrapper's v1 behaviour SHALL NOT enumerate arbitrary vault items
    into environment variables. Vault item projection MAY be added
    later under an explicit naming convention.
-4. **No plaintext env file on disk.** The installer and the wrapper
-   MUST NOT write fetched 1Password Environment variables to `.env`,
-   `.env.local`, shell profile files, or any other file on disk. The
-   wrapper SHALL pass Environment values to the child process
-   directly in memory, using whatever injection mechanism the current
-   `op` CLI provides (for example `op run --env-file=<path>` reading
-   from a process substitution, or an equivalent subcommand). The
-   implementer is expected to consult the 1Password CLI documentation
-   and pick the simplest mechanism that satisfies this principle.
-5. **Token access is scoped to the `IDENTIFIER` group.** The service
-   account token SHALL be persisted such that only `root` and members
-   of the Linux group named by `IDENTIFIER` can read it. Acceptable
-   storage mechanisms are an encrypted systemd credential (advanced;
-   used only when the operator explicitly opts in) and a
-   group-readable token file owned by `root:<IDENTIFIER>` with mode
-   `0640` (default). This intentionally permits the `IDENTIFIER`
-   user to read the raw token directly — the wrapper is the
-   recommended access path, not a technical gate. Stronger isolation
-   would require a setuid binary or a sudoers rule, both of which
-   are out of scope for v1.
-6. **Works from any directory.** The installed wrapper SHALL NOT
+4. **No plaintext secrets on disk.** Outside of the gitignored
+   `.env.local` bootstrap file at the repository root, the raw
+   service account token SHALL never exist on disk. The installer
+   and the wrapper MUST NOT write fetched 1Password Environment
+   variables to `.env`, `.env.local`, shell profile files, or any
+   other file on disk. The wrapper SHALL pass Environment values to
+   the child process directly in memory, using whatever injection
+   mechanism the current `op` CLI provides (for example
+   `op run --env-file=<path>` reading from a process substitution,
+   or an equivalent subcommand). The implementer is expected to
+   consult the 1Password CLI documentation and pick the simplest
+   mechanism that satisfies this principle.
+5. **Token storage is the systemd encrypted credential, only.** The
+   service account token SHALL be persisted exclusively as a
+   systemd encrypted credential at
+   `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
+   created via `systemd-creds encrypt`. A plaintext root-owned
+   token file (or any other on-disk plaintext representation) is
+   explicitly forbidden. Decryption requires `root`, so the wrapper
+   uses a brief `sudo -n` self-escalation to gain root, decrypts
+   the credential into memory, then immediately drops privileges
+   to the `IDENTIFIER` user via `setpriv` before invoking `op`.
+   The token never appears in a process command line and never
+   touches disk after decryption.
+6. **Sudoers grants the `IDENTIFIER` group passwordless escalation
+   for this one wrapper.** The installer SHALL drop a sudoers
+   fragment under `/etc/sudoers.d/with-<IDENTIFIER>-env` that lets
+   members of the `<IDENTIFIER>` group invoke the installed wrapper
+   as `root` with `NOPASSWD`. The fragment SHALL be scoped to the
+   one absolute path `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh`
+   and nothing else. The installer SHALL also add the invoking
+   operator (`$SUDO_USER`, when set and not already the
+   `IDENTIFIER` user) to the `IDENTIFIER` group so they can use
+   the wrapper directly after the next sudo evaluation.
+7. **Works from any directory.** The installed wrapper SHALL NOT
    depend on the caller's current working directory, repository
    location, or shell startup files.
-7. **Ad-hoc first.** The primary workflows are
+8. **Ad-hoc first.** The primary workflows are
    `with-<IDENTIFIER>-env.sh [command ...]` and
    `with-<IDENTIFIER>-env.sh` (interactive shell). Long-running
    systemd service integration MAY be added later but is not required
@@ -172,17 +195,15 @@ input if any required input is absent.
   (`IDENTIFIER`) using the 1Password CLI.
 - `INSTALL_PREFIX` — directory for the installed wrapper. Default:
   `/usr/local/bin`.
-- `CONFIG_DIR` — root-owned configuration directory. Default:
-  `/etc/onepassword-env-wrapper`.
-- `TOKEN_STORAGE_MODE` — either `systemd-credential` or
-  `root-owned-file`. Default: `root-owned-file`. The
-  `systemd-credential` mode is advanced and requires the operator
-  to arrange a privileged wrapper execution path themselves; the
-  installer SHALL fail fast with a clear message when
-  `systemd-credential` is selected but the host does not support
-  it.
 - `DEFAULT_SHELL` — shell to execute when the wrapper is invoked
   without a command. Default: `/bin/bash`.
+
+There is no `TOKEN_STORAGE_MODE` knob: token storage is always the
+systemd encrypted credential at
+`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`.
+There is no `CONFIG_DIR`: nothing other than the encrypted
+credential needs to be persisted on disk; identifier, vault, and
+shell are baked into the rendered wrapper at install time.
 
 Nothing else in the wrapper's identity is configurable: the installer
 always renders and installs `with-<IDENTIFIER>-env.sh`.
@@ -191,69 +212,79 @@ always renders and installs `with-<IDENTIFIER>-env.sh`.
 
 The installer SHALL, in order:
 
-1. Verify the host is Linux; exit non-zero on other platforms.
+1. Verify the host is Linux **with systemd**; exit non-zero
+   otherwise. Specifically, `systemctl --version`,
+   `systemd-creds --version`, and `setpriv --version` SHALL all
+   return successfully.
 2. Verify it is running as `uid 0`; exit non-zero with guidance to
    rerun under `sudo` otherwise.
-3. Verify `op` is installed and on `PATH` (e.g. `op --version`
-   returns successfully). The installer SHALL NOT attempt a stricter
-   semantic-version check; if the installed `op` lacks a feature the
-   wrapper needs, the wrapper's own invocation of `op` will surface
-   that at validation time in step 11.
+3. Verify `op`, `jq`, and `setpriv` are installed and on `PATH`
+   (`op --version`, `jq --version`, `setpriv --version` succeed).
+   The installer SHALL NOT attempt a stricter semantic-version
+   check on `op`; if the installed `op` lacks a feature the wrapper
+   needs, the wrapper's own invocation will surface that at
+   validation time.
 4. Verify the Linux user `IDENTIFIER` and the Linux group
    `IDENTIFIER` both exist.
 5. Validate all required inputs, including the `IDENTIFIER` regex.
    Exit non-zero on missing or invalid input, naming each offending
    input, without writing any files and without printing secret
    values.
-6. Create `CONFIG_DIR` with owner `root:<IDENTIFIER>` and mode
-   `0750` if it does not already exist (so the `IDENTIFIER` group
-   can traverse into it to reach the token file and the
-   configuration file). When `CONFIG_DIR` already exists but has
-   ownership or mode that is incompatible with this contract, the
-   installer SHALL `chown`/`chmod` it to match.
-7. Render the wrapper to `./with-<IDENTIFIER>-env.sh` at the
+6. Render the wrapper to `./with-<IDENTIFIER>-env.sh` at the
    repository root with mode `0755`, baking in the resolved
-   `IDENTIFIER`, `CONFIG_DIR`, Environment identifier,
-   `TOKEN_STORAGE_MODE`, and `DEFAULT_SHELL`. This file is the
-   gitignored build artifact an operator can inspect before install.
-8. Persist the service account token per `TOKEN_STORAGE_MODE`:
-   - `systemd-credential`: install an encrypted credential under
-     `/etc/credstore.encrypted` named for the identifier (for
-     example `1password-env-wrapper-<IDENTIFIER>`), scoped such that
-     only the wrapper's runtime context can decrypt it;
-   - `root-owned-file` (default): write the token to a file named
-     `<IDENTIFIER>.token` inside `CONFIG_DIR` with owner
-     `root:<IDENTIFIER>` and mode `0640`. Write atomically: create a
-     sibling temp file in the same directory, write the token, then
-     `mv` (same-filesystem rename is atomic on Linux).
-9. Install a non-secret configuration file inside `CONFIG_DIR` (for
-   example `<IDENTIFIER>.conf`) with owner `root:<IDENTIFIER>` and
-   mode `0640`, containing values such as the 1Password Environment
-   ID, the identifier, and the default shell. The configuration file
-   SHALL NOT contain the service account token, and it MAY be read
-   directly by the wrapper when it runs as the `IDENTIFIER` user.
-10. Install the wrapper by copying `./with-<IDENTIFIER>-env.sh` to
-    `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` with owner
-    `root:<IDENTIFIER>` and mode `0750`, atomically (write to a
-    sibling temp file in the same directory, then `mv` into place).
-11. Perform a read-only validation by invoking the installed wrapper
-    (or an equivalent `op` invocation with the stored token) and
-    confirming the 1Password Environment named by `IDENTIFIER` can
-    be read. Exit non-zero on failure, leaving any pre-existing
-    installed wrapper and token unchanged.
+   `IDENTIFIER`, vault name, encrypted-credential name, installed
+   path, and `DEFAULT_SHELL`. This file is the gitignored build
+   artifact an operator can inspect before install.
+7. Encrypt the service account token via `systemd-creds encrypt`
+   into `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
+   atomically (write a sibling temp file in the same directory,
+   then `mv` into place; the encrypted file SHALL be owner
+   `root:root` and mode `0600`). Ensure
+   `/etc/credstore.encrypted/` exists with owner `root:root` and
+   mode `0700` if it does not already.
+8. Install the wrapper by copying `./with-<IDENTIFIER>-env.sh` to
+   `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` with owner
+   `root:<IDENTIFIER>` and mode `0750`, atomically (write to a
+   sibling temp file in the same directory, then `mv` into place).
+9. Drop a sudoers fragment at
+   `/etc/sudoers.d/with-<IDENTIFIER>-env` with owner `root:root`
+   and mode `0440` containing exactly:
+   ```
+   %<IDENTIFIER> ALL=(root) NOPASSWD: ${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh
+   ```
+   The installer SHALL `visudo -cf` validate the fragment before
+   moving it into `/etc/sudoers.d/`. The fragment SHALL be
+   path-scoped to the installed wrapper and SHALL NOT grant any
+   broader sudo permission.
+10. If `$SUDO_USER` is set in the installer's environment and it is
+    neither empty, `root`, nor the `IDENTIFIER` user itself, add
+    `$SUDO_USER` to the `IDENTIFIER` group via
+    `usermod -aG <IDENTIFIER> "$SUDO_USER"` so that user gains
+    NOPASSWD access via the sudoers fragment from step 9. The
+    operator may need to start a fresh login session for the new
+    primary-group lookup to apply to interactive shells, but
+    `sudo` itself evaluates `/etc/group` on each invocation and
+    SHALL pick up the new membership immediately.
+11. Perform a read-only validation by invoking the installed
+    wrapper against `printenv` (or an equivalent `op` invocation
+    with the just-encrypted credential) and confirming the
+    1Password Environment named by `IDENTIFIER` can be read. Exit
+    non-zero on failure, leaving any pre-existing installed wrapper
+    and credential unchanged.
 12. Ensure `.gitignore` at the repository root contains the entries
     `/with-*-env.sh` and `.env.local`. For each entry that is
     already present, leave `.gitignore` unchanged; any missing entry
     SHALL be appended on its own line. The installer SHALL NOT
     rewrite or reorder unrelated `.gitignore` contents.
-13. Print a success line naming the installed wrapper path, the token
-    storage mode, and the token location (credential name or file
-    path). The success line SHALL NOT include the token value.
+13. Print a success line naming the installed wrapper path and the
+    encrypted-credential location
+    (`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`).
+    The success line SHALL NOT include the token value.
 
 The installer SHALL be idempotent: rerunning it with the same inputs
 SHALL produce the same filesystem state without duplicating
-`.gitignore` entries, without leaving stale temp files, and without
-creating additional credentials or config entries.
+`.gitignore` or sudoers entries, without leaving stale temp files,
+and without creating additional credentials.
 
 ## Installed Wrapper: `with-<IDENTIFIER>-env.sh`
 
@@ -280,34 +311,52 @@ with-<IDENTIFIER>-env.sh [--] [command [arg ...]]
 
 ### Runtime Behavior
 
-The wrapper SHALL:
+The wrapper runs in three stages, gated by an internal sentinel
+environment variable (e.g. `WRAPPER_STAGE`) so a single script file
+covers all three:
 
-- read the service account token via the configured
-  `TOKEN_STORAGE_MODE` (systemd credential decrypt, or direct read
-  of the group-readable token file in `CONFIG_DIR`);
-- unset `OP_CONNECT_HOST` and `OP_CONNECT_TOKEN` before invoking
-  `op`, because 1Password Connect variables take precedence over
-  `OP_SERVICE_ACCOUNT_TOKEN`;
-- set `OP_SERVICE_ACCOUNT_TOKEN` only in the environment of the `op`
-  process itself (for example via `env OP_SERVICE_ACCOUNT_TOKEN=... op ...`
-  or an inline `OP_SERVICE_ACCOUNT_TOKEN=... op ...`), and ensure the
-  final child command or shell does not inherit
-  `OP_SERVICE_ACCOUNT_TOKEN`;
-- set `OP_CACHE=false` unless a future explicit configuration permits
-  caching;
-- invoke `op` in a mode that injects Environment variables directly
-  into the child process without writing them to disk. The canonical
-  choice is `op run --env-file=<path>` where `<path>` is a file
-  whose lines reference 1Password secrets; equivalent `op`
-  subcommands are acceptable so long as no fetched value is written
-  to disk outside `op`'s own transient buffers. When the wrapper is
-  invoked with no command, invoke the interactive shell explicitly
-  (e.g. pass `-i` to `bash`) so the user gets an interactive prompt.
+1. **Stage 0 — escalate.** When invoked with `WRAPPER_STAGE` unset,
+   if the wrapper is not already `uid 0` it SHALL re-exec itself
+   under `sudo -n` with `WRAPPER_STAGE=1` and the absolute path of
+   the **installed** wrapper as the target — never the path the
+   caller used. This means invoking the gitignored rendered build
+   artifact at the repository root delegates to the installed copy
+   for the privileged step, so the sudoers fragment only ever
+   needs to whitelist the one installed path.
+2. **Stage 1 — decrypt and drop.** Running as `uid 0`, the wrapper
+   SHALL decrypt
+   `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
+   via `systemd-creds decrypt` directly into a memory variable,
+   then re-exec itself via `setpriv --reuid=<IDENTIFIER>
+   --regid=<IDENTIFIER> --init-groups` with a clean environment
+   (`env -i`) carrying only `HOME`, `PATH`, `OP_SERVICE_ACCOUNT_TOKEN`
+   (the just-decrypted token), and `WRAPPER_STAGE=2`. The token
+   never appears on a command line and never touches disk after
+   decryption.
+3. **Stage 2 — run.** Running as the `IDENTIFIER` user with the
+   token in env, the wrapper SHALL:
+   - `unset OP_CONNECT_HOST OP_CONNECT_TOKEN` so 1Password Connect
+     does not override `OP_SERVICE_ACCOUNT_TOKEN`;
+   - export `OP_CACHE=false`;
+   - enumerate the items in the 1Password vault named by
+     `IDENTIFIER` (e.g. `op item list --vault=<IDENTIFIER>
+     --format=json | jq …`), validate each item title is a POSIX
+     env-var name (`^[A-Za-z_][A-Za-z0-9_]*$`), and write a
+     transient env-file of `op://<vault>/<title>/credential`
+     references into a private `mktemp -d` directory cleaned up on
+     exit;
+   - exec `op run --no-masking --env-file=<that file> -- env -u
+     OP_SERVICE_ACCOUNT_TOKEN -- <command>` so the final child
+     never sees the token;
+   - when no command was supplied, run `DEFAULT_SHELL -i` instead.
 
 The wrapper SHALL fail closed with a non-zero exit code and an error
 message (but no secret values) when:
 
-- the token credential or file is missing or unreadable;
+- the encrypted credential is missing or `systemd-creds decrypt`
+  fails;
+- `sudo -n` escalation fails (the operator is not in the
+  `IDENTIFIER` group, or the sudoers fragment is missing);
 - the Environment ID cannot be resolved;
 - the service account token cannot read the Environment;
 - `op`'s injection mechanism returns a non-zero exit status before
@@ -406,9 +455,10 @@ The test SHALL use the identifier `openbrain` and assume that:
   `TEST_CREDENTIAL=TEST_VALUE`;
 - `.env.local` at the repository root contains
   `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>`;
-- the host provides `bats`, `op`, `sudo`, and the BATS support
-  libraries `bats-support` and `bats-assert` (or equivalents)
-  available on `PATH` or via `load`.
+- the host provides `bats`, `op`, `jq`, `sudo`, `setpriv`, the
+  systemd userspace (`systemctl`, `systemd-creds`), and the BATS
+  support libraries `bats-support` and `bats-assert` (or
+  equivalents) available on `PATH` or via `load`.
 
 ### Behavior
 
@@ -428,9 +478,19 @@ The test file SHALL:
    string.
 3. Assert that `/usr/local/bin/with-openbrain-env.sh` exists, is
    owned by `root:openbrain`, and has mode `0750`.
-4. Assert that `.gitignore` at the repository root contains the
+4. Assert that the encrypted credential file
+   `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
+   exists and is owned by `root:root` with mode `0600`, and that
+   no plaintext-token file exists anywhere under
+   `/etc/onepassword-env-wrapper/` (the directory itself MUST NOT
+   exist; this is the "no plaintext on disk" invariant).
+5. Assert that `.gitignore` at the repository root contains the
    patterns `/with-*-env.sh` and `.env.local`.
-5. Run the installed wrapper as the `openbrain` user against
+6. Assert that the sudoers fragment
+   `/etc/sudoers.d/with-openbrain-env` exists, is owned by
+   `root:root`, has mode `0440`, and contains the expected
+   `%openbrain ALL=(root) NOPASSWD: …` line.
+7. Run the installed wrapper as the `openbrain` user against
    `print-test-env-vars.sh`. Because the repository checkout MAY
    sit under a path that the `openbrain` user cannot traverse, the
    test SHALL stage an executable copy of `print-test-env-vars.sh`
@@ -442,18 +502,26 @@ The test file SHALL:
    - the output contains exactly the line `TEST_CREDENTIAL=TEST_VALUE`;
    - the output is sorted by variable name;
    - the output contains no `OP_SERVICE_ACCOUNT_TOKEN=` line.
-6. Run the installed wrapper as the `openbrain` user with the
-   command `env`; assert `TEST_CREDENTIAL=TEST_VALUE` appears in the
-   output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
-7. Run the installed wrapper as the `openbrain` user with the
+8. Run the installed wrapper as the `openbrain` user with the
+   command `env`; assert `TEST_CREDENTIAL=TEST_VALUE` appears in
+   the output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
+9. Run the installed wrapper as the `openbrain` user with the
    command `printenv OP_SERVICE_ACCOUNT_TOKEN` and assert the
    wrapper exit status is `1` (variable unset), confirming that the
    secret-zero token is not inherited by the child.
+10. Run the **rendered** build artifact at the repository root
+    (`./with-openbrain-env.sh`) directly as the BATS-invoking user
+    (with the staged `print-test-env-vars.sh` as the argument) and
+    assert it succeeds and produces `TEST_CREDENTIAL=TEST_VALUE`.
+    This proves stage-0 self-escalation via the sudoers fragment
+    works end-to-end for the operator who just ran the installer
+    (whose user was added to the `openbrain` group in installer
+    step 10).
 
 The test SHALL be idempotent: rerunning it SHALL succeed whether or
 not a prior install exists. The test SHOULD NOT remove the installed
-wrapper, token credential, or `CONFIG_DIR` contents on teardown;
-cleanup is an operator concern.
+wrapper, encrypted credential, sudoers fragment, or group
+membership on teardown; cleanup is an operator concern.
 
 ### Invocation
 
@@ -538,18 +606,22 @@ SHALL NOT rewrite, reorder, or remove any other `.gitignore` entries.
 - The installer MUST NOT store the service account token inside the
   repository working tree, in command history, in generated shell
   snippets, or in world-readable unit files.
-- The token SHALL be stored either as an encrypted systemd
-  credential (opt-in) or as a file inside `CONFIG_DIR` with owner
-  `root:<IDENTIFIER>` and mode `0640` (default). Both modes
-  restrict read access to `root` and members of the `IDENTIFIER`
-  group; wider-than-group read access SHALL NOT be used. Members of
-  the `IDENTIFIER` group MAY read the token file directly — the
-  wrapper is the recommended access path, not a technical gate.
-- `CONFIG_DIR` SHALL be owned by `root:<IDENTIFIER>` with mode
-  `0750`.
+- The token SHALL be stored exclusively as a systemd encrypted
+  credential at
+  `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
+  with owner `root:root` and mode `0600`. A plaintext token file
+  under any path (e.g. `/etc/onepassword-env-wrapper/*.token`) is
+  explicitly forbidden, and the installer SHALL NOT create
+  `/etc/onepassword-env-wrapper/` at all.
 - The installed wrapper at
   `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` SHALL be owned by
   `root:<IDENTIFIER>` with mode `0750`.
+- A sudoers fragment at
+  `/etc/sudoers.d/with-<IDENTIFIER>-env` (owner `root:root`, mode
+  `0440`) SHALL grant only members of the `<IDENTIFIER>` group
+  passwordless `sudo` for **only** the absolute path of the
+  installed wrapper. No other binary, no other group, no
+  wildcard.
 - The 1Password service account SHOULD have read-only access to only
   the Environment named `IDENTIFIER` and the vault named
   `IDENTIFIER`.
@@ -591,19 +663,27 @@ Then it exits non-zero before creating or modifying any files
 
 And it reports that `IDENTIFIER` is malformed
 
-### Scenario: Installer stores only secret zero
+### Scenario: Installer stores only secret zero, encrypted
 
 Given all required inputs are present with `IDENTIFIER=openbrain`
 
 When `sudo -E ./create-1password-env-wrapper.sh` completes successfully
 
-Then the service account token is persisted using the configured
-`TOKEN_STORAGE_MODE` and is readable only by `root` and members of
-the `openbrain` group (for `root-owned-file` mode: owner
-`root:openbrain`, mode `0640`)
+Then the service account token is persisted **only** as a systemd
+encrypted credential at
+`/etc/credstore.encrypted/1password-env-wrapper-openbrain` (owner
+`root:root`, mode `0600`)
+
+And no plaintext token file exists anywhere on the host outside the
+gitignored `.env.local`; in particular,
+`/etc/onepassword-env-wrapper/` does not exist
 
 And `${INSTALL_PREFIX}/with-openbrain-env.sh` exists with owner
 `root:openbrain` and mode `0750`
+
+And `/etc/sudoers.d/with-openbrain-env` exists with owner
+`root:root`, mode `0440`, and a single line granting
+`%openbrain` `NOPASSWD` on the installed wrapper
 
 And `.gitignore` at the repository root ignores both `/with-*-env.sh`
 and `.env.local`
@@ -672,11 +752,15 @@ When an administrator reruns
 `sudo -E ./create-1password-env-wrapper.sh` with the replacement
 `OP_SERVICE_ACCOUNT_TOKEN` and the same `IDENTIFIER`
 
-Then the persisted credential or token file is replaced atomically
+Then the encrypted credential at
+`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` is
+replaced atomically (write sibling temp file, then `mv`)
 
 And subsequent wrapper invocations use the replacement token
 
 And no fetched Environment variables have been persisted to disk
+
+And no plaintext token has been persisted to disk
 
 ### Scenario: BATS integration test proves the happy path
 
