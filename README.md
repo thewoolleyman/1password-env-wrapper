@@ -8,9 +8,10 @@ Environment](https://developer.1password.com/docs/environments)
 is sealed as a `systemd-creds` encrypted credential under
 `/etc/credstore.encrypted/`; the wrapper self-escalates via
 `sudo -n`, decrypts the credential into memory, then drops
-privileges via `setpriv` to the dedicated `IDENTIFIER` user before
-invoking `op run --environment <env-id>` so the final child
-process never sees `OP_SERVICE_ACCOUNT_TOKEN`.
+privileges via `setpriv` back to the **invoker** (the user who
+ran the wrapper) before invoking `op run --environment <env-id>`
+so the final child process runs as the invoker and never sees
+`OP_SERVICE_ACCOUNT_TOKEN`.
 
 The repo is opinionated for **single-VPS / single-operator personal
 use on Linux + systemd**. It is not a general-purpose secrets-management
@@ -21,8 +22,11 @@ solution.
 ```sh
 # Prerequisites: Linux with systemd, GNU sudo, setpriv,
 #   the 1Password CLI BETA (op >= 2.33.0-beta.02 — the stable line
-#   2.34.0 still lacks `op environment`), and a Linux user+group
-#   matching your chosen IDENTIFIER (e.g. `openbrain`).
+#   2.34.0 still lacks `op environment`), and a Linux *group*
+#   matching your chosen IDENTIFIER (e.g. `openbrain`). A Linux
+#   user named IDENTIFIER is no longer required — the wrapper
+#   drops privileges back to the invoker at runtime, not to a
+#   separate IDENTIFIER user.
 
 # 1. Populate .env.local in the repo root (gitignored):
 cat > .env.local <<'EOF'
@@ -58,7 +62,8 @@ bats test/integration.bats
 
 For deeper detail — including the three-stage `WRAPPER_STAGE`
 re-exec model (sudo-escalate → `systemd-creds decrypt` → `setpriv`
-drop-priv → `op run --environment`), the encrypted-state fallback,
-the canonical-source header on every rendered wrapper, and every
-acceptance scenario — read [`SPECIFICATION.md`](SPECIFICATION.md).
+drop-priv-to-invoker → `op run --environment`), the
+encrypted-state fallback, the canonical-source header on every
+rendered wrapper, and every acceptance scenario — read
+[`SPECIFICATION.md`](SPECIFICATION.md).
 For day-to-day operator workflow, read [`AGENTS.md`](AGENTS.md).

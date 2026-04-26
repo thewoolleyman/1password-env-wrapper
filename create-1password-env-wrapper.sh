@@ -63,10 +63,11 @@ fi
 [ -d "$INSTALL_PREFIX" ] || die "INSTALL_PREFIX does not exist: $INSTALL_PREFIX"
 
 # ---------------------------------------------------------------------------
-# Step 4: Linux user and group exist.
+# Step 4: Linux group exists. (A Linux user named $IDENTIFIER is no longer
+# required: the wrapper drops privileges back to the *invoker* at runtime,
+# not to a separate IDENTIFIER user. See SPECIFICATION.md § Architecture
+# Principles #5.)
 # ---------------------------------------------------------------------------
-getent passwd "$IDENTIFIER" >/dev/null \
-    || die "Linux user '$IDENTIFIER' does not exist (the installer SHALL NOT create it)"
 getent group "$IDENTIFIER" >/dev/null \
     || die "Linux group '$IDENTIFIER' does not exist (the installer SHALL NOT create it)"
 
@@ -158,9 +159,23 @@ case "\${WRAPPER_STAGE:-0}" in
         ;;
     1)
         # Stage 1 — running as root. Decrypt the credential into memory,
-        # then drop privileges to the IDENTIFIER user with the token in
-        # the env, and re-exec the wrapper as stage 2.
+        # then drop privileges back to the *invoker* (the user who ran
+        # sudo to get here, identified by SUDO_UID / SUDO_GID / SUDO_USER
+        # which sudo always sets on the elevated process), and re-exec
+        # the wrapper as stage 2. We drop to the invoker — not to a
+        # separate IDENTIFIER user — so files created or touched by the
+        # child command end up owned by whoever invoked the wrapper.
+        # See SPECIFICATION.md § Architecture Principles #5.
         [ "\$(id -u)" -eq 0 ] || die "stage 1 expected uid 0 (got \$(id -u))"
+        [ -n "\${SUDO_UID:-}" ] \\
+            || die "stage 1 expected SUDO_UID in env (sudo did not set it; was the wrapper invoked directly as root without sudo?)"
+        [ -n "\${SUDO_GID:-}" ] \\
+            || die "stage 1 expected SUDO_GID in env"
+        [ -n "\${SUDO_USER:-}" ] \\
+            || die "stage 1 expected SUDO_USER in env"
+        invoker_home="\$(getent passwd "\$SUDO_UID" | cut -d: -f6)"
+        [ -n "\$invoker_home" ] \\
+            || die "could not resolve home directory for SUDO_UID=\$SUDO_UID via getent"
         [ -r "\$SYSTEMD_CRED_PATH" ] \\
             || die "encrypted credential missing or unreadable: \$SYSTEMD_CRED_PATH"
         if ! token="\$(systemd-creds decrypt --name="\$SYSTEMD_CRED_NAME" "\$SYSTEMD_CRED_PATH" - 2>/dev/null)"; then
@@ -168,15 +183,15 @@ case "\${WRAPPER_STAGE:-0}" in
         fi
         [ -n "\$token" ] || die "decrypted credential is empty"
         exec env -i \\
-            HOME="/home/\$IDENTIFIER" \\
+            HOME="\$invoker_home" \\
             PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
             OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
             WRAPPER_STAGE=2 \\
-            setpriv --reuid="\$IDENTIFIER" --regid="\$IDENTIFIER" --init-groups -- \\
+            setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
             "\$INSTALLED_WRAPPER" "\$@"
         ;;
     2)
-        # Stage 2 — running as IDENTIFIER user with token in env.
+        # Stage 2 — running as the invoker with token in env.
         # Inject variables from the 1Password Environment (NOT from
         # any vault). The wrapper SHALL NOT call op item list,
         # op item get, op read, or any other vault-touching op

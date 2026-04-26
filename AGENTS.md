@@ -18,13 +18,16 @@ encrypted credential at
 `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` —
 plaintext token files on disk are explicitly forbidden. The wrapper
 self-escalates via `sudo -n`, decrypts the credential with
-`systemd-creds`, then drops privileges via `setpriv` to the
-`IDENTIFIER` user before invoking `op`. The token never appears on
-a command line and never touches disk after decryption.
+`systemd-creds`, then drops privileges via `setpriv` back to the
+**invoker** (the user who ran the wrapper, identified by the
+`SUDO_UID` / `SUDO_GID` / `SUDO_USER` env vars sudo always sets)
+before invoking `op`. The token never appears on a command line
+and never touches disk after decryption.
 
-A single `IDENTIFIER` value names the Linux user, Linux group,
-wrapper command, and credential scope. The 1Password Environment
-itself is identified by a separate input,
+A single `IDENTIFIER` value names the Linux group, wrapper command,
+credential filename, and 1Password Environment scope. It does NOT
+determine the runtime UID — that is always the invoker's UID. The
+1Password Environment itself is identified by a separate input,
 `ONEPASSWORD_ENVIRONMENT_ID`, copied from the 1Password desktop
 app: `Developer → View Environments → Manage environment → Copy
 environment ID`.
@@ -39,7 +42,10 @@ environment ID`.
   `2.35.0-beta.01`). Stable `op` 2.34.0 lacks the `op environment`
   subcommand and `op run --environment` flag. Download:
   <https://releases.1password.com/developers/cli-beta/>
-- An existing Linux **user** and **group** both named `IDENTIFIER`
+- An existing Linux **group** named `IDENTIFIER`. (A Linux user
+  named `IDENTIFIER` is NOT required — the wrapper drops
+  privileges back to the invoker at runtime, not to a separate
+  IDENTIFIER user.)
 - An existing 1Password **Environment** containing the variables
   to inject (each Environment entry is a `KEY=value` pair). Copy
   the Environment ID from the desktop app:
@@ -96,8 +102,10 @@ adjacent tooling), start a new login session or `exec sg
 
 ## Run a command via the wrapper
 
-As the `IDENTIFIER` user (members of the `IDENTIFIER` group may also
-execute the wrapper):
+As any user that is a member of the `IDENTIFIER` group (the
+sudoers fragment gates invocation on group membership; the
+runtime UID is always the invoker's, not a separate IDENTIFIER
+user):
 
 ```sh
 with-openbrain-env.sh some-command arg1 arg2
@@ -149,7 +157,8 @@ The repository ships a Bats integration test at
 1Password infrastructure. To run it:
 
 1. Make sure the host has `bats`, `bats-support`, `bats-assert`,
-   `op`, `jq`, `sudo`, and the Linux user/group `openbrain`.
+   `op`, `jq`, `sudo`, and the Linux group `openbrain` (a Linux
+   user named `openbrain` is no longer required).
 2. Populate the gitignored bootstrap secret file `.env.local` at the
    repository root with a real service account token AND the
    Environment ID. Starting from placeholders:
@@ -181,9 +190,11 @@ The repository ships a Bats integration test at
 ## Example shell interaction
 
 The following transcript shows an operator installing the wrapper
-with `IDENTIFIER=openbrain`, `openbrain` running the verification
-target, and `openbrain` using an interactive shell. The token value
-is an obvious placeholder.
+with `IDENTIFIER=openbrain`, then running the verification target
+and an interactive shell — both as the same operator (`admin`),
+because the wrapper drops privileges back to the invoker, not to
+a separate IDENTIFIER user. The token value is an obvious
+placeholder.
 
 ```console
 admin@vps:~/projects/1password-env-wrapper$ whoami
@@ -195,19 +206,16 @@ added admin to group openbrain (next sudo invocation picks this up)
 installed /usr/local/bin/with-openbrain-env.sh (root:openbrain, mode 0750)
 encrypted credential: /etc/credstore.encrypted/1password-env-wrapper-openbrain
 sudoers fragment:     /etc/sudoers.d/with-openbrain-env
-1Password vault:      openbrain
-admin@vps:~/projects/1password-env-wrapper$ sudo -iu openbrain
-openbrain@vps:~$ with-openbrain-env.sh /home/admin/projects/1password-env-wrapper/print-test-env-vars.sh
+1Password Environment ID: …env-id…
+admin@vps:~/projects/1password-env-wrapper$ with-openbrain-env.sh /home/admin/projects/1password-env-wrapper/print-test-env-vars.sh
 TEST_BAR=world
 TEST_FOO=hello
-openbrain@vps:~$ with-openbrain-env.sh
-openbrain@vps:~$ echo "$TEST_FOO"
+admin@vps:~/projects/1password-env-wrapper$ with-openbrain-env.sh
+admin@vps:~$ echo "$TEST_FOO"
 hello
-openbrain@vps:~$ echo "${OP_SERVICE_ACCOUNT_TOKEN:-<unset>}"
+admin@vps:~$ echo "${OP_SERVICE_ACCOUNT_TOKEN:-<unset>}"
 <unset>
-openbrain@vps:~$ exit
+admin@vps:~$ exit
 exit
-openbrain@vps:~$ exit
-logout
 admin@vps:~/projects/1password-env-wrapper$
 ```
