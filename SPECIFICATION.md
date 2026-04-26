@@ -163,9 +163,25 @@ All shell scripts in this repository SHALL:
    explicitly forbidden. Decryption requires `root`, so the wrapper
    uses a brief `sudo -n` self-escalation to gain root, decrypts
    the credential into memory, then immediately drops privileges
-   to the `IDENTIFIER` user via `setpriv` before invoking `op`.
-   The token never appears in a process command line and never
-   touches disk after decryption.
+   back to the **invoker** (the user who initiated the sudo
+   self-escalation, identified by the `SUDO_UID` / `SUDO_GID` /
+   `SUDO_USER` environment variables that `sudo` always sets on
+   the elevated process) via `setpriv` before invoking `op`. The
+   token never appears in a process command line and never touches
+   disk after decryption.
+
+   The runtime privilege target is the invoker, not the
+   `IDENTIFIER` user. This aligns the wrapper with the project's
+   single-VPS / single-operator scope: the operator owns the
+   files they intend to operate on (repo checkouts, deploy
+   tooling artifacts, build directories), and dropping into a
+   separate shared identity creates filesystem-permission friction
+   without increasing security on a host that already gates the
+   wrapper through the operator's own sudo session. `IDENTIFIER`
+   continues to scope the credential file, the wrapper command
+   name, the 1Password Environment, and the sudoers gate (via
+   group membership) — but NOT the runtime UID. There is no
+   requirement that a Linux user named `IDENTIFIER` exists.
 6. **Sudoers grants the `IDENTIFIER` group passwordless escalation
    for this one wrapper.** The installer SHALL drop a sudoers
    fragment under `/etc/sudoers.d/with-<IDENTIFIER>-env` that lets
@@ -173,9 +189,11 @@ All shell scripts in this repository SHALL:
    as `root` with `NOPASSWD`. The fragment SHALL be scoped to the
    one absolute path `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh`
    and nothing else. The installer SHALL also add the invoking
-   operator (`$SUDO_USER`, when set and not already the
-   `IDENTIFIER` user) to the `IDENTIFIER` group so they can use
-   the wrapper directly after the next sudo evaluation.
+   operator (`$SUDO_USER`, when set and not already `root`) to the
+   `IDENTIFIER` group so they can use the wrapper directly after
+   the next sudo evaluation. Group membership authorizes
+   invocation; it does not determine the runtime UID, which is
+   always the invoker's UID per principle 5.
 7. **Works from any directory.** The installed wrapper SHALL NOT
    depend on the caller's current working directory, repository
    location, or shell startup files.
@@ -249,8 +267,10 @@ The installer SHALL, in order:
    line). If the check fails, exit non-zero with a clear message
    instructing the operator to install the `op` beta from
    <https://releases.1password.com/developers/cli-beta/>.
-4. Verify the Linux user `IDENTIFIER` and the Linux group
-   `IDENTIFIER` both exist.
+4. Verify the Linux group `IDENTIFIER` exists. (A Linux user
+   named `IDENTIFIER` is NOT required; the runtime UID is the
+   invoker's per [Architecture Principles
+   §5](#architecture-principles).)
 5. Validate all required inputs, including the `IDENTIFIER` regex.
    Exit non-zero on missing or invalid input, naming each offending
    input, without writing any files and without printing secret
@@ -283,12 +303,11 @@ The installer SHALL, in order:
    path-scoped to the installed wrapper and SHALL NOT grant any
    broader sudo permission.
 10. If `$SUDO_USER` is set in the installer's environment and it is
-    neither empty, `root`, nor the `IDENTIFIER` user itself, add
-    `$SUDO_USER` to the `IDENTIFIER` group via
-    `usermod -aG <IDENTIFIER> "$SUDO_USER"` so that user gains
-    NOPASSWD access via the sudoers fragment from step 9. The
-    operator may need to start a fresh login session for the new
-    primary-group lookup to apply to interactive shells, but
+    neither empty nor `root`, add `$SUDO_USER` to the `IDENTIFIER`
+    group via `usermod -aG <IDENTIFIER> "$SUDO_USER"` so that user
+    gains NOPASSWD access via the sudoers fragment from step 9.
+    The operator may need to start a fresh login session for the
+    new primary-group lookup to apply to interactive shells, but
     `sudo` itself evaluates `/etc/group` on each invocation and
     SHALL pick up the new membership immediately.
 11. Perform a read-only validation by invoking the installed
@@ -379,17 +398,24 @@ covers all three:
    for the privileged step, so the sudoers fragment only ever
    needs to whitelist the one installed path.
 2. **Stage 1 — decrypt and drop.** Running as `uid 0`, the wrapper
-   SHALL decrypt
+   SHALL read the invoker's identity from the `SUDO_UID`,
+   `SUDO_GID`, and `SUDO_USER` environment variables (which `sudo`
+   always sets on the elevated process). It SHALL fail closed with
+   a clear error if any of these is unset (e.g. when the wrapper
+   was invoked as `root` directly without going through `sudo`).
+   It SHALL resolve the invoker's home directory via
+   `getent passwd <SUDO_UID>`. It SHALL then decrypt
    `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
    via `systemd-creds decrypt` directly into a memory variable,
-   then re-exec itself via `setpriv --reuid=<IDENTIFIER>
-   --regid=<IDENTIFIER> --init-groups` with a clean environment
-   (`env -i`) carrying only `HOME`, `PATH`, `OP_SERVICE_ACCOUNT_TOKEN`
-   (the just-decrypted token), and `WRAPPER_STAGE=2`. The token
-   never appears on a command line and never touches disk after
-   decryption.
-3. **Stage 2 — run.** Running as the `IDENTIFIER` user with the
-   token in env, the wrapper SHALL:
+   and re-exec itself via `setpriv --reuid=<SUDO_UID>
+   --regid=<SUDO_GID> --init-groups` with a clean environment
+   (`env -i`) carrying only `HOME` (the invoker's home), `PATH`
+   (a deterministic safe value: `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
+   `OP_SERVICE_ACCOUNT_TOKEN` (the just-decrypted token), and
+   `WRAPPER_STAGE=2`. The token never appears on a command line
+   and never touches disk after decryption.
+3. **Stage 2 — run.** Running as the invoker with the token in
+   env, the wrapper SHALL:
    - `unset OP_CONNECT_HOST OP_CONNECT_TOKEN` so 1Password Connect
      does not override `OP_SERVICE_ACCOUNT_TOKEN`;
    - export `OP_CACHE=false`;
@@ -410,6 +436,11 @@ message (but no secret values) when:
   fails;
 - `sudo -n` escalation fails (the operator is not in the
   `IDENTIFIER` group, or the sudoers fragment is missing);
+- `SUDO_UID` / `SUDO_GID` / `SUDO_USER` are unset in stage 1
+  (e.g. the wrapper was invoked directly as `root` without
+  `sudo`, so there is no invoker identity to drop back to);
+- `getent passwd <SUDO_UID>` cannot resolve the invoker's home
+  directory;
 - the configured Environment ID cannot be resolved by
   `op run --environment`;
 - the service account token cannot read the Environment;
