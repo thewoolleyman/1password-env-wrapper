@@ -41,15 +41,21 @@ runtime via `op run --environment <ENV-ID>`. The wrapper SHALL NOT
 enumerate items in any 1Password vault.
 
 The installer renders the wrapper, stores the 1Password service
-account token **only** as an encrypted systemd credential under
-`/etc/credstore.encrypted/`, and installs the wrapper under
-`/usr/local/bin` for a dedicated Linux user.
+account token in a platform-appropriate secure store, and installs
+the wrapper under `${INSTALL_PREFIX}` (default `/usr/local/bin`).
 
-The installer's only supported runtime target is **Linux with
-systemd**. Any plaintext-on-disk token storage (e.g. a root-owned
-`*.token` file under `/etc/`) is explicitly forbidden — outside of
-the gitignored `.env.local` bootstrap file at the repository root,
-the raw token SHALL never exist on disk.
+The installer's supported runtime targets are **Linux with systemd**
+and **macOS**. See [Platform Support](#platform-support) below for
+the full per-platform contract; the short version is that Linux
+stores the token as an encrypted systemd credential under
+`/etc/credstore.encrypted/` and gates wrapper invocation behind a
+sudoers fragment + group membership, while macOS stores the token
+in the per-user login Keychain and relies on the user's login
+session as the security boundary. Any plaintext-on-disk token
+storage (e.g. a root-owned `*.token` file under `/etc/`) is
+explicitly forbidden on either platform — outside of the gitignored
+`.env.local` bootstrap file at the repository root, the raw token
+SHALL never exist on disk.
 
 The 1Password CLI (`op`) MUST be a build that supports
 `op environment read` and `op run --environment` — these are the
@@ -69,20 +75,135 @@ artifact, so an operator can review the exact script that is about to
 be installed before privileged copy-in, but the rendered file never
 reaches version control.
 
+## Platform Support
+
+The installer and the rendered wrapper run on **Linux with systemd**
+and on **macOS**. Windows is out of scope.
+
+### Byte-identicality invariant
+
+For identical inputs (`IDENTIFIER`, `OP_SERVICE_ACCOUNT_TOKEN`,
+`ONEPASSWORD_ENVIRONMENT_ID`, `INSTALL_PREFIX`, `DEFAULT_SHELL`),
+the rendered wrapper at `${INSTALL_PREFIX}/with-${IDENTIFIER}-env.sh`
+SHALL be **byte-identical** whether the installer ran on Linux or on
+macOS. `diff -q` between the two renderings SHALL exit 0.
+
+This holds because the rendered wrapper always contains BOTH the
+Linux runtime branch and the macOS runtime branch; it dispatches
+between them at execution time via `case "$(uname -s)"`. The
+installer's *behavior* differs per host (different secure stores,
+different filesystem permissions, different sudoers handling); the
+wrapper's *bytes* do not.
+
+A consumer project MAY commit the rendered wrapper to its own
+repository and trust that the same file works on both Linux VPSs
+and macOS dev machines without diff thrash.
+
+### Linux runtime model (recap)
+
+The Linux path is a 3-stage `WRAPPER_STAGE` re-exec:
+
+1. **Stage 0 — escalate.** `sudo -n` self-escalate to root,
+   targeting the *installed* wrapper path (so the sudoers fragment
+   only ever needs to whitelist one absolute path).
+2. **Stage 1 — decrypt and drop.** As root, `systemd-creds decrypt`
+   the credential at
+   `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
+   into a memory variable, then `setpriv --reuid=$SUDO_UID
+   --regid=$SUDO_GID --init-groups` re-exec the wrapper as the
+   *invoker* with the token in env (`WRAPPER_STAGE=2`).
+3. **Stage 2 — run.** As the invoker, `op run --environment
+   <ONEPASSWORD_ENVIRONMENT_ID> -- env -u
+   OP_SERVICE_ACCOUNT_TOKEN -- "$@"` (so the final child never
+   sees the token).
+
+The full Stage-1 contract — including the `SUDO_UID`/`SUDO_GID`/
+`SUDO_USER` invariant, the `getent passwd` invoker-home lookup,
+the deterministic `PATH`, and the failure modes — is documented
+under "Runtime Behavior" below. That section applies to the Linux
+branch only; the macOS branch has its own contract in the next
+subsection.
+
+### macOS runtime model
+
+macOS is a **single-stage** path with **no privilege escalation
+and no privilege drop**:
+
+1. `security find-generic-password -s "<IDENTIFIER>" -a
+   "OP_SERVICE_ACCOUNT_TOKEN" -w` retrieves the token from the
+   per-user login Keychain into a memory variable.
+2. `unset OP_CONNECT_HOST OP_CONNECT_TOKEN; export OP_CACHE=false`
+   (parity with the Linux Stage-2 hardening).
+3. `exec env OP_SERVICE_ACCOUNT_TOKEN="$token" op run
+   --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID> -- env
+   -u OP_SERVICE_ACCOUNT_TOKEN -- "$@"` so the final child never
+   sees the token.
+
+Rationale for the asymmetry: single-user macOS dev machines do not
+have a separate IDENTIFIER user that needs isolating from the
+invoker, and macOS has no sudo-equivalent of "escalate to read the
+credstore then drop back." The login Keychain itself provides the
+access control — only the user's logged-in session can read it,
+and macOS does not give other users on the same system any way to
+read it without that session's authentication. If a future
+deployment scenario requires per-user isolation on macOS, that is
+a separate, larger design problem.
+
+The macOS path SHALL fail closed with a non-zero exit code and an
+error message (no secret values) when:
+
+- the Keychain entry is missing (`security find-generic-password`
+  exits non-zero);
+- the Keychain entry is present but empty;
+- the configured Environment ID cannot be resolved by `op run
+  --environment`;
+- the service account token cannot read the Environment;
+- `op`'s injection mechanism returns a non-zero exit status before
+  the child command runs.
+
+When the child command runs, the wrapper SHALL propagate the
+child's exit code as its own.
+
+### Per-platform installer behavior
+
+| Aspect | Linux | macOS |
+|---|---|---|
+| Invocation | `sudo -E ./create-…sh` | `./create-…sh` (no sudo) |
+| Token store | `systemd-creds encrypt` → `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` (root:root, 0600) | `security add-generic-password -U` → login Keychain (service `<IDENTIFIER>`, account `OP_SERVICE_ACCOUNT_TOKEN`) |
+| Wrapper owner | `root:<IDENTIFIER>`, mode `0750` | invoking user, mode `0755` |
+| Sudoers fragment | `/etc/sudoers.d/with-<IDENTIFIER>-env` (root:root, 0440) | none |
+| Group membership | invoker added to `<IDENTIFIER>` group | none |
+| Linux IDENTIFIER group required | yes | no |
+| Default `INSTALL_PREFIX` | `/usr/local/bin` | `/usr/local/bin` (falls back to `~/.local/bin/` if not writable) |
+| Prereqs | `sudo`, `setpriv`, `systemd-creds`, `op` (Environments-aware) | `security` (always present), `op` (Environments-aware) |
+
+Both platforms share the inputs (`IDENTIFIER`,
+`OP_SERVICE_ACCOUNT_TOKEN`, `ONEPASSWORD_ENVIRONMENT_ID`,
+`INSTALL_PREFIX`, `DEFAULT_SHELL`), the rendered wrapper bytes, the
+`.gitignore` discipline, and the validation step (decrypt/recover
+the token, then `op environment read` to confirm the Environment
+is reachable).
+
 ## The `IDENTIFIER` concept
 
-A single `IDENTIFIER` input names the Linux/wrapper-side coupled
-entities:
+A single `IDENTIFIER` input names the wrapper-side coupled entities:
 
-- the Linux **user** that runs the wrapper;
-- the Linux **group** that owns the wrapper binary so only its
-  members may execute it (members of this group are also the
-  operators allowed to invoke the wrapper without a sudo password
-  prompt);
-- the wrapper command name `with-<IDENTIFIER>-env.sh`;
-- the systemd encrypted credential name
+- the wrapper command name `with-<IDENTIFIER>-env.sh` (both platforms);
+- on **Linux**, the Linux **group** that owns the installed wrapper
+  binary so only its members may execute it (members of this group
+  are the operators allowed to invoke the wrapper without a sudo
+  password prompt) and the systemd encrypted credential name
   `1password-env-wrapper-<IDENTIFIER>` under
-  `/etc/credstore.encrypted/`.
+  `/etc/credstore.encrypted/`;
+- on **macOS**, the Keychain **service name** under which the
+  service-account token is stored (`security add-generic-password
+  -s "<IDENTIFIER>" -a OP_SERVICE_ACCOUNT_TOKEN -w ...`).
+
+`IDENTIFIER` does NOT determine the runtime UID on either platform.
+On Linux, the wrapper drops privileges back to the *invoker* at
+runtime via `setpriv`, not to a separate IDENTIFIER user; a Linux
+user named `IDENTIFIER` is not required. On macOS, the wrapper runs
+as the invoking user throughout (no privilege escalation occurs).
 
 The 1Password-side coupled entity — the **1Password Environment** —
 is identified by its **Environment ID** (a 1Password-assigned
@@ -99,10 +220,11 @@ letter; no trailing hyphen; total length 2–32. The installer SHALL
 reject values that do not match. Example values: `openbrain`,
 `acme-prod`.
 
-The installer SHALL NOT attempt to create the Linux user, the Linux
-group, or the 1Password Environment. All three SHALL already exist
-before installation; the operator SHALL provide
-`ONEPASSWORD_ENVIRONMENT_ID` for the Environment.
+The installer SHALL NOT attempt to create the Linux group (Linux),
+nor the 1Password Environment (any platform). On Linux, the
+IDENTIFIER group SHALL already exist before installation. The
+operator SHALL provide `ONEPASSWORD_ENVIRONMENT_ID` for the
+Environment on either platform.
 
 ## Repository Layout
 
@@ -154,46 +276,64 @@ All shell scripts in this repository SHALL:
    other file on disk. Variables flow from `op run --environment`'s
    internal channel directly into the child process; no
    intermediate file is created.
-5. **Token storage is the systemd encrypted credential, only.** The
-   service account token SHALL be persisted exclusively as a
-   systemd encrypted credential at
-   `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
-   created via `systemd-creds encrypt`. A plaintext root-owned
-   token file (or any other on-disk plaintext representation) is
-   explicitly forbidden. Decryption requires `root`, so the wrapper
-   uses a brief `sudo -n` self-escalation to gain root, decrypts
-   the credential into memory, then immediately drops privileges
-   back to the **invoker** (the user who initiated the sudo
-   self-escalation, identified by the `SUDO_UID` / `SUDO_GID` /
-   `SUDO_USER` environment variables that `sudo` always sets on
-   the elevated process) via `setpriv` before invoking `op`. The
-   token never appears in a process command line and never touches
-   disk after decryption.
-
-   The runtime privilege target is the invoker, not the
-   `IDENTIFIER` user. This aligns the wrapper with the project's
-   single-VPS / single-operator scope: the operator owns the
-   files they intend to operate on (repo checkouts, deploy
-   tooling artifacts, build directories), and dropping into a
-   separate shared identity creates filesystem-permission friction
-   without increasing security on a host that already gates the
-   wrapper through the operator's own sudo session. `IDENTIFIER`
-   continues to scope the credential file, the wrapper command
-   name, the 1Password Environment, and the sudoers gate (via
-   group membership) — but NOT the runtime UID. There is no
-   requirement that a Linux user named `IDENTIFIER` exists.
-6. **Sudoers grants the `IDENTIFIER` group passwordless escalation
-   for this one wrapper.** The installer SHALL drop a sudoers
-   fragment under `/etc/sudoers.d/with-<IDENTIFIER>-env` that lets
-   members of the `<IDENTIFIER>` group invoke the installed wrapper
-   as `root` with `NOPASSWD`. The fragment SHALL be scoped to the
-   one absolute path `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh`
-   and nothing else. The installer SHALL also add the invoking
-   operator (`$SUDO_USER`, when set and not already `root`) to the
+5. **Token storage is the platform's secure store, only.** The
+   service account token SHALL be persisted exclusively in a
+   platform-appropriate secure store. A plaintext token file
+   (or any other on-disk plaintext representation) is explicitly
+   forbidden on either platform.
+   - On **Linux**, the secure store is the systemd encrypted
+     credential at
+     `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
+     created via `systemd-creds encrypt`. Decryption requires
+     `root`, so the wrapper uses a brief `sudo -n` self-escalation
+     to gain root, decrypts the credential into memory, then
+     immediately drops privileges back to the **invoker** (the user
+     who initiated the sudo self-escalation, identified by the
+     `SUDO_UID` / `SUDO_GID` / `SUDO_USER` environment variables
+     that `sudo` always sets on the elevated process) via
+     `setpriv` before invoking `op`. The token never appears in a
+     process command line and never touches disk after decryption.
+     The runtime privilege target is the invoker, not the
+     `IDENTIFIER` user. This aligns the wrapper with the project's
+     single-VPS / single-operator scope: the operator owns the
+     files they intend to operate on (repo checkouts, deploy
+     tooling artifacts, build directories), and dropping into a
+     separate shared identity creates filesystem-permission friction
+     without increasing security on a host that already gates the
+     wrapper through the operator's own sudo session. `IDENTIFIER`
+     continues to scope the credential file, the wrapper command
+     name, the 1Password Environment, and the sudoers gate (via
+     group membership) — but NOT the runtime UID. There is no
+     requirement that a Linux user named `IDENTIFIER` exists.
+   - On **macOS**, the secure store is the per-user **login
+     Keychain**, stored as a generic password under service name
+     `<IDENTIFIER>` and account name `OP_SERVICE_ACCOUNT_TOKEN`,
+     created via `security add-generic-password -U`. macOS
+     restricts Keychain reads to the user's logged-in session, so
+     no privilege escalation is needed and none is performed; the
+     wrapper runs entirely as the invoking user, retrieves the
+     token via `security find-generic-password -w` into a memory
+     variable, and execs `op run --environment …` with the token
+     in env. As on Linux, the token never appears in a process
+     command line and never touches disk after retrieval.
+6. **Linux: sudoers grants the `IDENTIFIER` group passwordless
+   escalation for this one wrapper. macOS: no sudoers, no group.**
+   On **Linux**, the installer SHALL drop a sudoers fragment under
+   `/etc/sudoers.d/with-<IDENTIFIER>-env` that lets members of the
+   `<IDENTIFIER>` group invoke the installed wrapper as `root` with
+   `NOPASSWD`. The fragment SHALL be scoped to the one absolute
+   path `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` and nothing
+   else. The installer SHALL also add the invoking operator
+   (`$SUDO_USER`, when set and not already `root`) to the
    `IDENTIFIER` group so they can use the wrapper directly after
    the next sudo evaluation. Group membership authorizes
    invocation; it does not determine the runtime UID, which is
    always the invoker's UID per principle 5.
+
+   On **macOS**, no sudoers fragment is installed and no
+   IDENTIFIER group is required or created — the per-user login
+   Keychain is itself the access-control gate, and there is no
+   privilege escalation to grant.
 7. **Works from any directory.** The installed wrapper SHALL NOT
    depend on the caller's current working directory, repository
    location, or shell startup files.
@@ -205,12 +345,23 @@ All shell scripts in this repository SHALL:
 
 ## Installer Script: `create-1password-env-wrapper.sh`
 
-The installer SHALL be invoked from the repository root under `sudo`,
-because it writes under `/etc` and `/usr/local/bin`:
+The installer SHALL be invoked from the repository root.
 
-```text
-sudo -E ./create-1password-env-wrapper.sh
-```
+- On **Linux**, the installer writes under `/etc` and
+  `/usr/local/bin` and so requires root:
+  ```text
+  sudo -E ./create-1password-env-wrapper.sh
+  ```
+- On **macOS**, the installer writes only to the per-user login
+  Keychain and to `${INSTALL_PREFIX}` (default `/usr/local/bin`,
+  falling back to `~/.local/bin/` if not writable). It SHALL be run
+  as the invoking user without `sudo`; the installer SHALL refuse
+  to run under `sudo` on macOS, because Keychain seeding under
+  `sudo` would target `/var/root`'s login keychain instead of the
+  operator's:
+  ```text
+  ./create-1password-env-wrapper.sh
+  ```
 
 The installer SHALL be configured entirely by environment variables.
 It SHALL validate all required inputs before making any filesystem
@@ -219,9 +370,10 @@ input if any required input is absent.
 
 ### Required Inputs
 
-- `IDENTIFIER` — shared name for the Linux user, Linux group,
-  wrapper command, and credential scope. MUST match the regex
-  defined in "The `IDENTIFIER` concept".
+- `IDENTIFIER` — shared name for the wrapper command and credential
+  scope. On Linux it also names the Linux group that gates wrapper
+  invocation; on macOS it also names the Keychain service entry.
+  MUST match the regex defined in "The `IDENTIFIER` concept".
 - `OP_SERVICE_ACCOUNT_TOKEN` — token for a 1Password service
   account with read access to the 1Password Environment identified
   by `ONEPASSWORD_ENVIRONMENT_ID`.
@@ -253,83 +405,120 @@ always renders and installs `with-<IDENTIFIER>-env.sh`.
 
 The installer SHALL, in order:
 
-1. Verify the host is Linux **with systemd**; exit non-zero
-   otherwise. Specifically, `systemctl --version`,
-   `systemd-creds --version`, and `setpriv --version` SHALL all
-   return successfully.
-2. Verify it is running as `uid 0`; exit non-zero with guidance to
-   rerun under `sudo` otherwise.
-3. Verify `op` and `setpriv` are installed and on `PATH`
-   (`op --version`, `setpriv --version` succeed). Additionally,
-   verify the installed `op` supports the Environments feature by
-   asserting that `op environment --help` exits successfully (the
-   `environment` subcommand was introduced in the `2.33.0-beta.02`
-   line). If the check fails, exit non-zero with a clear message
-   instructing the operator to install the `op` beta from
+1. **Detect the platform** via `uname -s`. If the value is neither
+   `Linux` nor `Darwin`, exit non-zero with a clear message naming
+   the unsupported platform, before doing any other work.
+2. **Verify platform-specific prerequisites.**
+   - On **Linux**: `systemctl --version`, `systemd-creds --version`,
+     and `setpriv --version` SHALL all succeed; the process SHALL be
+     running as `uid 0` (exit non-zero with guidance to rerun under
+     `sudo` otherwise).
+   - On **macOS**: `security` SHALL be on `PATH` (it is part of the
+     OS, but check anyway); the process SHALL **not** be running as
+     `uid 0` (exit non-zero with guidance to rerun without `sudo`,
+     because Keychain seeding under `sudo` would target
+     `/var/root`'s login keychain).
+3. **Verify common tooling.** `op` SHALL be installed and on `PATH`
+   (`op --version` succeeds), and the installed `op` SHALL support
+   the Environments feature (`op environment --help` exits
+   successfully). The `environment` subcommand was introduced in
+   the `2.33.0-beta.02` line; if the check fails, exit non-zero
+   with a clear message instructing the operator to install the
+   `op` beta from
    <https://releases.1password.com/developers/cli-beta/>.
-4. Verify the Linux group `IDENTIFIER` exists. (A Linux user
-   named `IDENTIFIER` is NOT required; the runtime UID is the
-   invoker's per [Architecture Principles
-   §5](#architecture-principles).)
-5. Validate all required inputs, including the `IDENTIFIER` regex.
-   Exit non-zero on missing or invalid input, naming each offending
-   input, without writing any files and without printing secret
-   values.
-6. Render the wrapper to `./with-<IDENTIFIER>-env.sh` at the
+4. **Linux only — verify the IDENTIFIER group exists.** (A Linux
+   user named `IDENTIFIER` is NOT required; the runtime UID is the
+   invoker's per [Architecture Principles §5](#architecture-principles).)
+   On macOS, no group lookup is performed.
+5. **Validate all required inputs**, including the `IDENTIFIER`
+   regex. Exit non-zero on missing or invalid input, naming each
+   offending input, without writing any files and without printing
+   secret values. On macOS, if `INSTALL_PREFIX` does not exist or
+   is not writable by the invoker, fall back to `~/.local/bin/`
+   (creating it if necessary) and log the fallback.
+6. **Render the wrapper** to `./with-<IDENTIFIER>-env.sh` at the
    repository root with mode `0755`, baking in the resolved
-   `IDENTIFIER`, `ONEPASSWORD_ENVIRONMENT_ID`,
-   encrypted-credential name, installed path, and `DEFAULT_SHELL`.
+   `IDENTIFIER`, `ONEPASSWORD_ENVIRONMENT_ID`, installed path,
+   `DEFAULT_SHELL`, and the platform-scoped constants
+   (`LINUX_SYSTEMD_CRED_NAME` / `LINUX_SYSTEMD_CRED_PATH` for the
+   Linux runtime branch, `MACOS_KEYCHAIN_SERVICE` /
+   `MACOS_KEYCHAIN_TOKEN_ACCOUNT` for the Darwin runtime branch).
+   The rendered wrapper SHALL contain BOTH platform branches
+   regardless of which host did the rendering — see
+   [Byte-identicality invariant](#byte-identicality-invariant).
    This file is the gitignored build artifact an operator can
    inspect before install.
-7. Encrypt the service account token via `systemd-creds encrypt`
-   into `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
-   atomically (write a sibling temp file in the same directory,
-   then `mv` into place; the encrypted file SHALL be owner
-   `root:root` and mode `0600`). Ensure
-   `/etc/credstore.encrypted/` exists with owner `root:root` and
-   mode `0700` if it does not already.
-8. Install the wrapper by copying `./with-<IDENTIFIER>-env.sh` to
-   `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` with owner
-   `root:<IDENTIFIER>` and mode `0750`, atomically (write to a
-   sibling temp file in the same directory, then `mv` into place).
-9. Drop a sudoers fragment at
+7. **Store the service account token** in the platform-appropriate
+   secure store, replacing any prior value:
+   - On **Linux**: encrypt the token via `systemd-creds encrypt`
+     into `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`,
+     atomically (write a sibling temp file in the same directory,
+     then `mv` into place; the encrypted file SHALL be owner
+     `root:root` and mode `0600`). Ensure `/etc/credstore.encrypted/`
+     exists with owner `root:root` and mode `0700` if it does not
+     already.
+   - On **macOS**: invoke `security add-generic-password -s
+     "<IDENTIFIER>" -a OP_SERVICE_ACCOUNT_TOKEN -w "<token>" -U`.
+     The `-U` flag updates an existing entry in place and creates a
+     new one otherwise — making rotation idempotent. The Keychain
+     entry lands in the operator's login keychain.
+8. **Install the wrapper** by copying `./with-<IDENTIFIER>-env.sh`
+   to `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh`, atomically
+   (write to a sibling temp file in the same directory, then `mv`
+   into place):
+   - On **Linux**: owner `root:<IDENTIFIER>`, mode `0750`.
+   - On **macOS**: owner = the invoking user (no `chown`), mode
+     `0755`.
+9. **Linux only — drop a sudoers fragment** at
    `/etc/sudoers.d/with-<IDENTIFIER>-env` with owner `root:root`
    and mode `0440` containing exactly:
    ```
-   %<IDENTIFIER> ALL=(root) NOPASSWD: ${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh
+   %<IDENTIFIER> ALL=(root) NOPASSWD: SETENV: ${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh
    ```
    The installer SHALL `visudo -cf` validate the fragment before
    moving it into `/etc/sudoers.d/`. The fragment SHALL be
    path-scoped to the installed wrapper and SHALL NOT grant any
-   broader sudo permission.
-10. If `$SUDO_USER` is set in the installer's environment and it is
-    neither empty nor `root`, add `$SUDO_USER` to the `IDENTIFIER`
-    group via `usermod -aG <IDENTIFIER> "$SUDO_USER"` so that user
-    gains NOPASSWD access via the sudoers fragment from step 9.
-    The operator may need to start a fresh login session for the
-    new primary-group lookup to apply to interactive shells, but
-    `sudo` itself evaluates `/etc/group` on each invocation and
-    SHALL pick up the new membership immediately.
-11. Perform a read-only validation by invoking the installed
-    wrapper against `printenv` (or an equivalent `op` invocation
-    with the just-encrypted credential) and confirming the
-    1Password Environment named by `IDENTIFIER` can be read. Exit
-    non-zero on failure, leaving any pre-existing installed wrapper
-    and credential unchanged.
-12. Ensure `.gitignore` at the repository root contains the entries
-    `/with-*-env.sh` and `.env.local`. For each entry that is
-    already present, leave `.gitignore` unchanged; any missing entry
-    SHALL be appended on its own line. The installer SHALL NOT
-    rewrite or reorder unrelated `.gitignore` contents.
-13. Print a success line naming the installed wrapper path and the
-    encrypted-credential location
-    (`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`).
+   broader sudo permission. The `SETENV:` tag is required so the
+   wrapper can propagate `WRAPPER_STAGE` through the
+   self-escalation step. On macOS, no sudoers fragment is written
+   and `/etc/sudoers.d/` is not touched.
+10. **Linux only — add the invoking operator to the IDENTIFIER
+    group.** If `$SUDO_USER` is set in the installer's environment
+    and it is neither empty nor `root` nor `$IDENTIFIER`, add
+    `$SUDO_USER` to the `IDENTIFIER` group via `usermod -aG
+    <IDENTIFIER> "$SUDO_USER"` so that user gains NOPASSWD access
+    via the sudoers fragment from step 9. The operator may need to
+    start a fresh login session for the new primary-group lookup to
+    apply to interactive shells, but `sudo` itself evaluates
+    `/etc/group` on each invocation and SHALL pick up the new
+    membership immediately. On macOS, no group operation is
+    performed.
+11. **Read-only validation against 1Password.** Recover the
+    just-stored token from its platform-appropriate store
+    (`systemd-creds decrypt` on Linux, `security
+    find-generic-password -w` on macOS) and confirm the configured
+    Environment is reachable via `op environment read
+    "<ONEPASSWORD_ENVIRONMENT_ID>"`. Exit non-zero on failure,
+    leaving any pre-existing installed wrapper and stored
+    credential unchanged.
+12. **Ensure `.gitignore` entries** at the repository root contain
+    the entries `/with-*-env.sh` and `.env.local`. For each entry
+    that is already present, leave `.gitignore` unchanged; any
+    missing entry SHALL be appended on its own line. The installer
+    SHALL NOT rewrite or reorder unrelated `.gitignore` contents.
+13. **Print a success line** naming the installed wrapper path and
+    the platform-appropriate token-store location:
+    - On Linux: the encrypted-credential path
+      (`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`)
+      and the sudoers fragment path.
+    - On macOS: the Keychain service/account.
     The success line SHALL NOT include the token value.
 
-The installer SHALL be idempotent: rerunning it with the same inputs
-SHALL produce the same filesystem state without duplicating
-`.gitignore` or sudoers entries, without leaving stale temp files,
-and without creating additional credentials.
+The installer SHALL be idempotent on either platform: rerunning it
+with the same inputs SHALL produce the same filesystem (and
+Keychain) state without duplicating `.gitignore` or sudoers
+entries, without leaving stale temp files, and without creating
+additional credentials.
 
 ## Installed Wrapper: `with-<IDENTIFIER>-env.sh`
 
@@ -385,7 +574,21 @@ with-<IDENTIFIER>-env.sh [--] [command [arg ...]]
 
 ### Runtime Behavior
 
-The wrapper runs in three stages, gated by an internal sentinel
+The wrapper begins by dispatching on `uname -s`:
+
+- `Linux` → run the three-stage `WRAPPER_STAGE` re-exec model
+  detailed below.
+- `Darwin` → run the single-stage Keychain → `op run` path
+  detailed in [macOS runtime model](#macos-runtime-model).
+- anything else → exit non-zero with a clear "unsupported platform"
+  message.
+
+The remainder of this section describes the **Linux runtime
+contract** in full. The macOS contract is in
+[Platform Support](#platform-support); when this subsection refers
+to "the wrapper" it means the Linux branch unless otherwise noted.
+
+The Linux branch runs in three stages, gated by an internal sentinel
 environment variable (e.g. `WRAPPER_STAGE`) so a single script file
 covers all three:
 
@@ -531,21 +734,24 @@ NOT modify it.
 ### Encrypted-state fallback
 
 After a successful install, both pieces of bootstrap state are
-already on the host: the service-account token is sealed in
-`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`, and
-the Environment ID is baked into
-`${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` as a
-`readonly ONEPASSWORD_ENVIRONMENT_ID='…'` line. Consumers MAY
-fall back to those sources when `.env.local` is missing, missing
-the relevant key, or the relevant key is `PLACEHOLDER`:
+already on the host: the service-account token is sealed in the
+platform-appropriate secure store, and the Environment ID is baked
+into `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` as a `readonly
+ONEPASSWORD_ENVIRONMENT_ID='…'` line. Consumers MAY fall back to
+those sources when `.env.local` is missing, missing the relevant
+key, or the relevant key is `PLACEHOLDER`:
 
-- **Token fallback**:
+- **Token fallback (Linux)**:
   `sudo systemd-creds decrypt --name=1password-env-wrapper-<IDENTIFIER>
   /etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER> -`
-- **Environment-ID fallback**: parse the `readonly
-  ONEPASSWORD_ENVIRONMENT_ID='…'` line out of
-  `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` (e.g. via `sudo grep`
-  + `sed`).
+- **Token fallback (macOS)**:
+  `security find-generic-password -s "<IDENTIFIER>" -a
+  OP_SERVICE_ACCOUNT_TOKEN -w`
+- **Environment-ID fallback (both platforms)**: parse the
+  `readonly ONEPASSWORD_ENVIRONMENT_ID='…'` line out of
+  `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` (e.g. via `grep` +
+  `sed`; on Linux, prefix with `sudo` if the file is mode `0750`
+  and the caller is not in the `<IDENTIFIER>` group).
 
 The fallback lets an operator delete `.env.local` once the install
 has succeeded so the raw token no longer lives in plaintext on
@@ -563,7 +769,9 @@ acceptance scenarios in this specification.
 
 The test SHALL use the identifier `openbrain` and assume that:
 
-- a Linux user and group `openbrain` exist on the host;
+- on Linux, the group `openbrain` exists on the host (a Linux
+  *user* named `openbrain` is not required); on macOS, no group or
+  user precondition applies;
 - a 1Password service account exists with read access to a
   1Password Environment (the Environment's name is irrelevant to
   the wrapper; only its ID is used);
@@ -574,15 +782,27 @@ The test SHALL use the identifier `openbrain` and assume that:
   repository root contains both
   `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>` and
   `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=<env id>`, OR a previous
-  successful install left the encrypted credential and installed
-  wrapper on the host so the encrypted-state fallback (see the
-  `.env.local` section above) can recover them;
+  successful install left the platform-appropriate token store
+  populated and the installed wrapper on the host so the
+  encrypted-state fallback (see the `.env.local` section above)
+  can recover them;
 - the host provides `bats`, an Environments-aware `op` build
-  (`2.33.0-beta.02`+), `sudo` (GNU sudo, with env-preservation),
-  `setpriv`, the systemd userspace (`systemctl`,
-  `systemd-creds`), and the BATS support libraries `bats-support`
-  and `bats-assert` (or equivalents) available on `PATH` or via
-  `load`.
+  (`2.33.0-beta.02`+), and the BATS support libraries
+  `bats-support` and `bats-assert` (or equivalents) available on
+  `PATH` or via `load`. On Linux, the host additionally provides
+  `sudo` (GNU sudo, with env-preservation), `setpriv`, and the
+  systemd userspace (`systemctl`, `systemd-creds`). On macOS, the
+  host additionally provides the `security` CLI (always present).
+
+Test cases SHALL be platform-gated where they assert
+platform-specific filesystem state — Linux-only assertions (sudoers
+fragment, systemd-creds file, root:openbrain ownership, `sudo -u
+openbrain` invocations) SHALL be skipped on macOS via a Bats
+`skip` guard, and macOS-only assertions (Keychain entry,
+user-owned wrapper) SHALL be skipped on Linux. Assertions that
+apply to both platforms (rendered-wrapper canonical-source header,
+`.gitignore` entries, wrapper output for the test target) run on
+both.
 
 ### Behavior
 
@@ -592,11 +812,15 @@ The test file SHALL:
    then resolve each bootstrap value (token and Environment ID)
    in this order:
    1. value from `.env.local` (if present and not `PLACEHOLDER`);
-   2. value from the encrypted-state fallback (decrypt
-      `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
-      for the token; grep
-      `/usr/local/bin/with-openbrain-env.sh` for the Environment
-      ID).
+   2. value from the platform-appropriate encrypted-state fallback:
+      - Linux: decrypt
+        `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
+        via `sudo systemd-creds decrypt --name=…` for the token;
+      - macOS: read `security find-generic-password -s openbrain
+        -a OP_SERVICE_ACCOUNT_TOKEN -w` for the token.
+      Both platforms grep
+      `${INSTALL_PREFIX}/with-openbrain-env.sh` for the Environment
+      ID.
 
    If neither source yields a real value for either input, fail
    fast with a clear error naming the missing input and
@@ -604,34 +828,44 @@ The test file SHALL:
    resolved token (as `OP_SERVICE_ACCOUNT_TOKEN`) and Environment
    ID (as `ONEPASSWORD_ENVIRONMENT_ID`) into each installer
    invocation only — not as global test-process env vars.
-2. Invoke the installer under `sudo -E` with `IDENTIFIER=openbrain`
-   and `ONEPASSWORD_ENVIRONMENT_ID` set, capturing stdout, stderr,
-   and exit status. Assert exit status `0`, that the installer
-   reported installing `/usr/local/bin/with-openbrain-env.sh`, and
-   that the installer output contains neither the raw token value
-   nor the placeholder string.
-3. Assert that `/usr/local/bin/with-openbrain-env.sh` exists, is
-   owned by `root:openbrain`, and has mode `0750`.
-4. Assert that the encrypted credential file
-   `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
-   exists and is owned by `root:root` with mode `0600`, and that
-   no plaintext-token file exists anywhere under
-   `/etc/onepassword-env-wrapper/` (the directory itself MUST NOT
-   exist; this is the "no plaintext on disk" invariant).
+2. Invoke the installer with `IDENTIFIER=openbrain` and
+   `ONEPASSWORD_ENVIRONMENT_ID` set, capturing stdout, stderr, and
+   exit status. On Linux the invocation is under `sudo -E`; on
+   macOS the invocation is direct (no `sudo`). Assert exit status
+   `0`, that the installer reported installing
+   `${INSTALL_PREFIX}/with-openbrain-env.sh`, and that the
+   installer output contains neither the raw token value nor the
+   placeholder string.
+3. Assert that `${INSTALL_PREFIX}/with-openbrain-env.sh` exists,
+   with the platform-appropriate ownership and mode:
+   - Linux: owned by `root:openbrain`, mode `0750`.
+   - macOS: owned by the invoking user, mode `0755`.
+4. Assert that the platform-appropriate token store is populated:
+   - Linux: the encrypted credential file
+     `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
+     exists, is owned by `root:root` with mode `0600`, AND no
+     plaintext-token file exists anywhere under
+     `/etc/onepassword-env-wrapper/` (the directory itself MUST
+     NOT exist; this is the "no plaintext on disk" invariant).
+   - macOS: `security find-generic-password -s openbrain -a
+     OP_SERVICE_ACCOUNT_TOKEN -w` returns a non-empty string.
 5. Assert that `.gitignore` at the repository root contains the
-   patterns `/with-*-env.sh` and `.env.local`.
-6. Assert that the sudoers fragment
+   patterns `/with-*-env.sh` and `.env.local` (both platforms).
+6. **Linux only**: assert that the sudoers fragment
    `/etc/sudoers.d/with-openbrain-env` exists, is owned by
    `root:root`, has mode `0440`, and contains the expected
-   `%openbrain ALL=(root) NOPASSWD: …` line.
-7. Run the installed wrapper as the `openbrain` user against
-   `print-test-env-vars.sh`. Because the repository checkout MAY
-   sit under a path that the `openbrain` user cannot traverse, the
-   test SHALL stage an executable copy of `print-test-env-vars.sh`
-   at a world-readable path that `openbrain` can reach (for example
-   `/tmp/print-test-env-vars.<random>.sh`, `chmod 0755`), run the
-   wrapper against that staged path, and remove the staged copy on
-   teardown. Assert:
+   `%openbrain ALL=(root) NOPASSWD: SETENV: …` line. Skip on
+   macOS.
+7. Run the installed wrapper against `print-test-env-vars.sh`.
+   - Linux: run as the `openbrain` user via `sudo -u openbrain`.
+     Because the repository checkout MAY sit under a path that the
+     `openbrain` user cannot traverse, the test SHALL stage an
+     executable copy of `print-test-env-vars.sh` at a
+     world-readable path (for example
+     `/tmp/print-test-env-vars.<random>.sh`, `chmod 0755`).
+   - macOS: run as the BATS-invoking user (no `sudo -u`); the
+     stage-and-chmod step is unnecessary but harmless.
+   On both platforms, assert:
    - exit status `0`;
    - the output contains the lines
      `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
@@ -641,63 +875,85 @@ The test file SHALL:
      regressing back to the vault-enumeration model);
    - the output is sorted by variable name;
    - the output contains no `OP_SERVICE_ACCOUNT_TOKEN=` line.
-8. Run the installed wrapper as the `openbrain` user with the
-   command `env`; assert
-   `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` appears in the
-   output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
-9. Run the installed wrapper as the `openbrain` user with the
-   command `printenv OP_SERVICE_ACCOUNT_TOKEN` and assert the
-   wrapper exit status is `1` (variable unset), confirming that the
-   secret-zero token is not inherited by the child.
+8. Run the installed wrapper with the command `env` (as the
+   `openbrain` user on Linux, as the BATS-invoking user on macOS);
+   assert `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` appears in
+   the output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
+9. Run the installed wrapper with the command
+   `printenv OP_SERVICE_ACCOUNT_TOKEN` (same user-selection rule
+   as 8) and assert the wrapper exit status is `1` (variable
+   unset), confirming that the secret-zero token is not inherited
+   by the child.
 10. Run the **rendered** build artifact at the repository root
     (`./with-openbrain-env.sh`) directly as the BATS-invoking user
     (with the staged `print-test-env-vars.sh` as the argument) and
     assert it succeeds and produces
-    `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE`. This proves
-    stage-0 self-escalation via the sudoers fragment works
+    `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE`. On Linux this
+    proves stage-0 self-escalation via the sudoers fragment works
     end-to-end for the operator who just ran the installer (whose
-    user was added to the `openbrain` group in installer step 10).
+    user was added to the `openbrain` group in installer step 10);
+    on macOS this proves the rendered artifact and installed copy
+    behave identically (no escalation involved).
+11. Assert the rendered build artifact at the repository root
+    (`./with-openbrain-env.sh`) is byte-identical to the installed
+    wrapper at `${INSTALL_PREFIX}/with-openbrain-env.sh`
+    (`cmp` exits `0`). This holds on both platforms and supports
+    the cross-platform byte-identicality invariant.
 
-The test SHALL be idempotent: rerunning it SHALL succeed whether or
-not a prior install exists. The test SHOULD NOT remove the installed
-wrapper, encrypted credential, sudoers fragment, or group
-membership on teardown; cleanup is an operator concern.
+The test SHALL be idempotent on either platform: rerunning it SHALL
+succeed whether or not a prior install exists. The test SHOULD NOT
+remove the installed wrapper, the platform-appropriate token store,
+the sudoers fragment (Linux), or the group membership (Linux) on
+teardown; cleanup is an operator concern.
 
 ### Invocation
 
-Operators run the test from the repository root:
+Operators run the test from the repository root on either platform:
 
 ```text
 bats test/integration.bats
 ```
 
-The test itself invokes `sudo` where needed; the outer `bats` process
-does not need to run as root, but the session MUST be able to escalate
-via `sudo` without a password prompt, or the operator MUST be
-prepared to enter their password at the first escalation.
+On Linux, the test invokes `sudo` where needed; the outer `bats`
+process does not need to run as root, but the session MUST be able
+to escalate via `sudo` without a password prompt, or the operator
+MUST be prepared to enter their password at the first escalation.
+On macOS, the test runs entirely as the invoking user — no `sudo`
+escalation is performed.
 
 ## Usage Documentation: `AGENTS.md`
 
 `AGENTS.md` SHALL document, for both human and agent readers:
 
 1. **What this repo is** — one short paragraph.
-2. **Prerequisites** — Linux host with `systemd` (for encrypted
-   credentials), `sudo` (GNU, with env-preservation), the
-   Environments-aware 1Password CLI (`op` `2.33.0-beta.02`+)
-   installed and on `PATH`, an existing Linux user and group both
-   named `IDENTIFIER`, an existing 1Password Environment, and a
-   1Password service account token with read access to that
-   Environment.
-3. **Installing the wrapper** — exact commands to run
-   `sudo -E ./create-1password-env-wrapper.sh`, including how to
-   supply `IDENTIFIER`, `OP_SERVICE_ACCOUNT_TOKEN`, and
-   `ONEPASSWORD_ENVIRONMENT_ID` without recording the token in
-   shell history. Document how to obtain
-   `ONEPASSWORD_ENVIRONMENT_ID` via the 1Password desktop app
-   (`Developer → View Environments → Manage environment → Copy
-   environment ID`).
+2. **Prerequisites** — split into common and platform-specific:
+   - Common: an Environments-aware 1Password CLI (`op`
+     `2.33.0-beta.02`+) installed and on `PATH`, an existing
+     1Password Environment, and a 1Password service account token
+     with read access to that Environment.
+   - **Linux**: a host with `systemd` (`systemctl`,
+     `systemd-creds`), `sudo` (GNU, with env-preservation),
+     `setpriv`, and an existing Linux *group* named `IDENTIFIER`
+     (a Linux *user* named `IDENTIFIER` is not required).
+   - **macOS**: a host with the `security` CLI (always present);
+     no group, no `sudo`, no `setpriv`.
+3. **Installing the wrapper** — exact commands per platform:
+   - **Linux**: `sudo -E ./create-1password-env-wrapper.sh`.
+   - **macOS**: `./create-1password-env-wrapper.sh` (no `sudo`).
+   Document how to supply `IDENTIFIER`,
+   `OP_SERVICE_ACCOUNT_TOKEN`, and `ONEPASSWORD_ENVIRONMENT_ID`
+   without recording the token in shell history (e.g. bash
+   local-env prefix with leading-space history skipping). Document
+   how to obtain `ONEPASSWORD_ENVIRONMENT_ID` via the 1Password
+   desktop app (`Developer → View Environments → Manage
+   environment → Copy environment ID`). Document the
+   platform-appropriate token-store location (systemd-creds path
+   on Linux, Keychain service/account on macOS).
 4. **Running a command via the wrapper** — exact commands for the
-   arbitrary-command form, as the `IDENTIFIER` user.
+   arbitrary-command form. On Linux, the caller must be a member
+   of the `IDENTIFIER` group (the installer adds `$SUDO_USER` to
+   it automatically); on macOS, the caller is the user that ran
+   the installer.
 5. **Opening an interactive shell via the wrapper** — exact command
    and a note that `exit` returns to the outer shell.
 6. **Verifying the wrapper** — how to run the installed wrapper
@@ -751,22 +1007,29 @@ SHALL NOT rewrite, reorder, or remove any other `.gitignore` entries.
 - The installer MUST NOT store the service account token inside the
   repository working tree, in command history, in generated shell
   snippets, or in world-readable unit files.
-- The token SHALL be stored exclusively as a systemd encrypted
-  credential at
-  `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
-  with owner `root:root` and mode `0600`. A plaintext token file
-  under any path (e.g. `/etc/onepassword-env-wrapper/*.token`) is
-  explicitly forbidden, and the installer SHALL NOT create
-  `/etc/onepassword-env-wrapper/` at all.
+- The token SHALL be stored exclusively in the platform-appropriate
+  secure store:
+  - **Linux**: a systemd encrypted credential at
+    `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
+    with owner `root:root` and mode `0600`. A plaintext token file
+    under any path (e.g. `/etc/onepassword-env-wrapper/*.token`)
+    is explicitly forbidden, and the installer SHALL NOT create
+    `/etc/onepassword-env-wrapper/` at all.
+  - **macOS**: the operator's login Keychain, as a generic
+    password under service `<IDENTIFIER>`, account
+    `OP_SERVICE_ACCOUNT_TOKEN`. No on-disk plaintext file is
+    created on macOS either.
 - The installed wrapper at
-  `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` SHALL be owned by
-  `root:<IDENTIFIER>` with mode `0750`.
-- A sudoers fragment at
+  `${INSTALL_PREFIX}/with-<IDENTIFIER>-env.sh` SHALL be owned with
+  the platform-appropriate ownership and mode:
+  - **Linux**: `root:<IDENTIFIER>`, mode `0750`.
+  - **macOS**: the invoking user, mode `0755`.
+- **Linux only**: a sudoers fragment at
   `/etc/sudoers.d/with-<IDENTIFIER>-env` (owner `root:root`, mode
   `0440`) SHALL grant only members of the `<IDENTIFIER>` group
   passwordless `sudo` for **only** the absolute path of the
   installed wrapper. No other binary, no other group, no
-  wildcard.
+  wildcard. macOS installs no sudoers fragment.
 - The 1Password service account SHOULD have read-only access to only
   the Environment named `IDENTIFIER` and the vault named
   `IDENTIFIER`.
@@ -780,8 +1043,9 @@ SHALL NOT rewrite, reorder, or remove any other `.gitignore` entries.
   replacement service account and rerunning the installer.
 - These controls reduce accidental exposure and limit blast radius;
   they do not protect against a fully compromised root account on
-  the host. A compromise of root exposes the service account token
-  and every secret it can reach.
+  the host (Linux) or a fully compromised user login session
+  (macOS). A compromise of either exposes the service account
+  token and every secret it can reach.
 
 ## Acceptance Scenarios
 
@@ -809,9 +1073,10 @@ Then it exits non-zero before creating or modifying any files
 
 And it reports that `IDENTIFIER` is malformed
 
-### Scenario: Installer stores only secret zero, encrypted
+### Scenario: Installer stores only secret zero, encrypted (Linux)
 
 Given all required inputs are present with `IDENTIFIER=openbrain`
+on a Linux host
 
 When `sudo -E ./create-1password-env-wrapper.sh` completes successfully
 
@@ -837,6 +1102,53 @@ and `.env.local`
 And no `.env` or similar file has been written with fetched
 Environment variables (the pre-existing `.env.local` bootstrap file
 SHALL NOT have been rewritten by the installer)
+
+### Scenario: Installer stores only secret zero, encrypted (macOS)
+
+Given all required inputs are present with `IDENTIFIER=openbrain`
+on a macOS host
+
+When `./create-1password-env-wrapper.sh` (no `sudo`) completes successfully
+
+Then the service account token is persisted **only** as a generic
+password in the operator's login Keychain under service
+`openbrain`, account `OP_SERVICE_ACCOUNT_TOKEN` (recoverable via
+`security find-generic-password -s openbrain -a
+OP_SERVICE_ACCOUNT_TOKEN -w`)
+
+And no plaintext token file exists anywhere on the host outside the
+gitignored `.env.local`
+
+And `${INSTALL_PREFIX}/with-openbrain-env.sh` exists, is owned by
+the invoking user, and is mode `0755`
+
+And `/etc/sudoers.d/with-openbrain-env` does NOT exist (no sudoers
+fragment is created on macOS)
+
+And `/etc/credstore.encrypted/1password-env-wrapper-openbrain` does
+NOT exist (no systemd-creds storage is used on macOS)
+
+And `.gitignore` at the repository root ignores both `/with-*-env.sh`
+and `.env.local`
+
+### Scenario: Rendered wrapper bytes are identical across platforms
+
+Given a Linux host and a macOS host that have both received the
+identical inputs (same `IDENTIFIER`, same
+`OP_SERVICE_ACCOUNT_TOKEN`, same `ONEPASSWORD_ENVIRONMENT_ID`, same
+`INSTALL_PREFIX`, same `DEFAULT_SHELL`)
+
+When `create-1password-env-wrapper.sh` is run on each host with
+those inputs
+
+Then the resulting `${INSTALL_PREFIX}/with-${IDENTIFIER}-env.sh`
+files on the two hosts are byte-identical (`diff -q` exits `0`)
+
+And the rendered build artifact at the repository root
+(`./with-${IDENTIFIER}-env.sh`) on each host is byte-identical to
+the installed wrapper on that same host (so a consumer that
+copies the rendered artifact between hosts gets the same bytes
+that an in-place install on the target host would have produced)
 
 ### Scenario: Wrapper starts an interactive shell
 
@@ -897,13 +1209,18 @@ And the wrapper reports that 1Password Environment injection failed
 
 Given the service account token has been rotated in 1Password
 
-When an administrator reruns
-`sudo -E ./create-1password-env-wrapper.sh` with the replacement
-`OP_SERVICE_ACCOUNT_TOKEN` and the same `IDENTIFIER`
+When an administrator reruns the installer with the replacement
+`OP_SERVICE_ACCOUNT_TOKEN` and the same `IDENTIFIER` (on Linux:
+`sudo -E ./create-1password-env-wrapper.sh`; on macOS:
+`./create-1password-env-wrapper.sh`)
 
-Then the encrypted credential at
-`/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` is
-replaced atomically (write sibling temp file, then `mv`)
+Then the platform-appropriate token store is replaced atomically:
+- on **Linux**, the encrypted credential at
+  `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>` is
+  rewritten via sibling-temp-file + `mv`;
+- on **macOS**, the Keychain entry under service `<IDENTIFIER>`,
+  account `OP_SERVICE_ACCOUNT_TOKEN`, is updated in place via
+  `security add-generic-password -U`.
 
 And subsequent wrapper invocations use the replacement token
 
@@ -918,7 +1235,9 @@ Given `.env.local` at the repository root contains a real
 `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` (neither equal to
 `PLACEHOLDER`)
 
-And the `openbrain` Linux user and group exist
+And on Linux, the `openbrain` group exists (a Linux *user* named
+`openbrain` is not required); on macOS, no group/user precondition
+applies
 
 And the 1Password Environment identified by
 `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` contains
