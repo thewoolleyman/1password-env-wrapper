@@ -349,6 +349,7 @@ else
             -s "$MACOS_KEYCHAIN_SERVICE" \
             -a "$MACOS_KEYCHAIN_TOKEN_ACCOUNT" \
             -w "$OP_SERVICE_ACCOUNT_TOKEN" \
+            -A \
             -U >/dev/null 2>&1; then
         die "security add-generic-password failed (could not seal the service account token in the macOS Keychain)"
     fi
