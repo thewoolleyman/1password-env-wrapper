@@ -111,11 +111,19 @@ The Linux path is a 3-stage `WRAPPER_STAGE` re-exec:
    `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
    into a memory variable, then `setpriv --reuid=$SUDO_UID
    --regid=$SUDO_GID --init-groups` re-exec the wrapper as the
-   *invoker* with the token in env (`WRAPPER_STAGE=2`).
-3. **Stage 2 — run.** As the invoker, `op run --environment
+   *invoker* with the token in env (`WRAPPER_STAGE=2`). Two
+   default-off, caller-supplied opt-ins MAY adjust this hop:
+   `OPENV_KEEP_PRIVILEGES=1` skips the `setpriv` drop (the command
+   runs at the current uid, i.e. root), and `OPENV_PRESERVE_VARS`
+   carries named variables through the `env -i` scrub. Both are
+   detailed in [Architecture Principles §5](#architecture-principles)
+   and "Runtime Behavior" below.
+3. **Stage 2 — run.** As the invoker (or as root when
+   `OPENV_KEEP_PRIVILEGES=1`), `op run --environment
    <ONEPASSWORD_ENVIRONMENT_ID> -- env -u
-   OP_SERVICE_ACCOUNT_TOKEN -- "$@"` (so the final child never
-   sees the token).
+   OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"` (so the final
+   child sees neither the token nor the internal `WRAPPER_STAGE`
+   sentinel).
 
 The full Stage-1 contract — including the `SUDO_UID`/`SUDO_GID`/
 `SUDO_USER` invariant, the `getent passwd` invoker-home lookup,
@@ -136,8 +144,15 @@ and no privilege drop**:
    (parity with the Linux Stage-2 hardening).
 3. `exec env OP_SERVICE_ACCOUNT_TOKEN="$token" op run
    --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID> -- env
-   -u OP_SERVICE_ACCOUNT_TOKEN -- "$@"` so the final child never
-   sees the token.
+   -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"` so the final
+   child sees neither the token nor the internal `WRAPPER_STAGE`
+   sentinel (the latter so a nested wrapper invocation re-runs its
+   own stages). The inner `env -u …` uses no GNU `--` separator, so
+   a POSIX/uutils `env` accepts it; op's own `--` is retained. The
+   `OPENV_KEEP_PRIVILEGES` and `OPENV_PRESERVE_VARS` opt-ins are
+   inert on macOS: there is no privilege escalation to keep and no
+   `env -i` scrub to carry variables through (caller variables
+   already reach the child).
 
 Rationale for the asymmetry: single-user macOS dev machines do not
 have a separate IDENTIFIER user that needs isolating from the
@@ -305,6 +320,45 @@ All shell scripts in this repository SHALL:
      name, the 1Password Environment, and the sudoers gate (via
      group membership) — but NOT the runtime UID. There is no
      requirement that a Linux user named `IDENTIFIER` exists.
+
+     Two runtime opt-ins, both **default-off** and read from the
+     caller's environment, MAY adjust the Stage-1 transition. They
+     are project-agnostic (the wrapper hard-codes no consumer-specific
+     name or value) and SHALL be exact no-ops when unset, so every
+     existing invocation is behaviorally identical:
+     - **`OPENV_KEEP_PRIVILEGES`** — when set to `1`, the Linux
+       Stage-1 transition SHALL NOT `setpriv`-drop to the invoker;
+       the final command instead runs at the wrapper's current uid
+       (which is `root` when Stage 1 was reached via the `sudo -n`
+       self-escalation). This is the explicit opt-OUT of "drop to
+       invoker" above, intended for admin tooling that must reach
+       root-only resources (for example a root-owned unix socket)
+       that the invoker's uid cannot otherwise access. When unset,
+       empty, or any value other than `1`, the wrapper drops to the
+       invoker exactly as it does by default. `OPENV_KEEP_PRIVILEGES`
+       survives the Stage 0→1 hop because that hop does not `env -i`
+       scrub. In the keep-privileges branch the wrapper SHALL set
+       `HOME` to the **current uid's** home directory (resolved via
+       `getent passwd "$(id -u)"`, falling back to `/root`), NOT the
+       invoker's home: the child stays at the current (root) uid, and
+       `op run` refuses to use a config directory under a `HOME` owned
+       by a different uid. The default drop-to-invoker branch keeps
+       `HOME` set to the invoker's home, since the child runs as the
+       invoker there. macOS performs no escalation or drop, so this
+       opt-in is inert there.
+     - **`OPENV_PRESERVE_VARS`** — a comma-separated allowlist of
+       environment-variable NAMES whose current values SHALL be
+       carried THROUGH the Stage-1 `env -i` scrub into the final
+       command. The wrapper trims surrounding whitespace from each
+       name, skips empty entries, and for each surviving name appends
+       `NAME=<current value>` to the scrubbed environment. When unset
+       or empty, nothing extra is preserved. This is the generic,
+       caller-controlled mechanism for forwarding a named secret or
+       setting across the scrub; the wrapper never hard-codes any
+       specific variable name. Only the caller decides which names
+       cross the boundary. macOS performs no `env -i` scrub, so
+       caller-supplied variables already pass through to the final
+       command; this opt-in is therefore inert there.
    - On **macOS**, the secure store is the per-user **login
      Keychain**, stored as a generic password under service name
      `<IDENTIFIER>` and account name `OP_SERVICE_ACCOUNT_TOKEN`,
@@ -610,21 +664,44 @@ covers all three:
    `getent passwd <SUDO_UID>`. It SHALL then decrypt
    `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
    via `systemd-creds decrypt` directly into a memory variable,
-   and re-exec itself via `setpriv --reuid=<SUDO_UID>
+   and (by default) re-exec itself via `setpriv --reuid=<SUDO_UID>
    --regid=<SUDO_GID> --init-groups` with a clean environment
    (`env -i`) carrying only `HOME` (the invoker's home), `PATH`
    (a deterministic safe value: `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
    `OP_SERVICE_ACCOUNT_TOKEN` (the just-decrypted token), and
    `WRAPPER_STAGE=2`. The token never appears on a command line
-   and never touches disk after decryption.
-3. **Stage 2 — run.** Running as the invoker with the token in
-   env, the wrapper SHALL:
+   and never touches disk after decryption. The `env -i`
+   invocation SHALL NOT use a GNU-style `--` separator after its
+   `NAME=value` operands: a POSIX-conformant `env` (including the
+   uutils coreutils `env`) ends its assignment list at the first
+   non-assignment word and rejects a trailing `--`. The `setpriv`
+   `--` separator (which precedes the command and is `setpriv`'s
+   own argument convention, not `env`'s) is retained. The two
+   default-off opt-ins from [Architecture Principles §5](#architecture-principles)
+   apply here: when `OPENV_KEEP_PRIVILEGES=1`, Stage 1 SHALL omit
+   the `setpriv` drop entirely and re-exec at its current uid — and
+   in that branch SHALL set `HOME` to the current uid's home
+   (`getent passwd "$(id -u)"`, falling back to `/root`) rather than
+   the invoker's, so `op run`'s config-directory ownership check is
+   satisfied for the root child; and for each name in
+   `OPENV_PRESERVE_VARS` it SHALL splice an extra `NAME=<current
+   value>` operand into the `env -i` argument list so that named
+   value survives the scrub.
+3. **Stage 2 — run.** Running as the invoker (or as `root` when
+   `OPENV_KEEP_PRIVILEGES=1` was set) with the token in env, the
+   wrapper SHALL:
    - `unset OP_CONNECT_HOST OP_CONNECT_TOKEN` so 1Password Connect
      does not override `OP_SERVICE_ACCOUNT_TOKEN`;
    - export `OP_CACHE=false`;
    - exec `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
-     -- env -u OP_SERVICE_ACCOUNT_TOKEN -- <command>` so the final
-     child never sees the service-account token;
+     -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE <command>`
+     so the final child sees neither the service-account token nor
+     the internal `WRAPPER_STAGE` sentinel. Stripping `WRAPPER_STAGE`
+     lets one wrapper invoke another (a nested wrapper) without the
+     inner wrapper inheriting a stale stage and skipping its own
+     stages. As with Stage 1's `env -i`, this `env -u …` invocation
+     uses no GNU-style `--` after its options (op's own `--`, which
+     separates `op run` arguments from the child command, is kept);
    - when no command was supplied, run `DEFAULT_SHELL -i` instead.
 
 The wrapper SHALL NOT call `op item list`, `op item get`, `op read`,
@@ -668,6 +745,16 @@ exit code as its own exit code.
   SHALL win.
 - `OP_SERVICE_ACCOUNT_TOKEN` SHALL NOT be present in the final child
   process environment.
+- The internal `WRAPPER_STAGE` sentinel SHALL NOT be present in the
+  final child process environment, so a wrapper invoked from inside
+  another wrapped command re-runs its own stages rather than
+  inheriting a stale stage.
+- When `OPENV_PRESERVE_VARS` names a variable, that variable's
+  value as seen by the wrapper at Stage 1 SHALL be present in the
+  final child process environment unless the 1Password Environment
+  also defines a variable of the same name (in which case the
+  1Password value wins, per the override rule above). `OPENV_*`
+  control variables themselves are not injected into the child.
 
 ## Test Target: `print-test-env-vars.sh`
 
