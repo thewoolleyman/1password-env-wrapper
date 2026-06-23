@@ -228,7 +228,11 @@ case "\$(uname -s)" in
                 fi
                 if [ "\$(id -u)" -eq 0 ]; then
                     # Already root; jump straight to stage 1 without sudo.
-                    exec env WRAPPER_STAGE=1 -- "\$INSTALLED_WRAPPER" "\$@"
+                    # No \`--\` after the assignment: uutils \`env\` (and POSIX
+                    # \`env\`) reject a GNU-style \`--\` separator following
+                    # NAME=value operands; the assignment list already ends at
+                    # the first non-assignment word.
+                    exec env WRAPPER_STAGE=1 "\$INSTALLED_WRAPPER" "\$@"
                 fi
                 if ! sudo_path="\$(command -v sudo)"; then
                     die "sudo not found on PATH; required to escalate for credential decryption"
@@ -260,13 +264,63 @@ case "\$(uname -s)" in
                     die "systemd-creds decrypt failed for \$LINUX_SYSTEMD_CRED_PATH"
                 fi
                 [ -n "\$token" ] || die "decrypted credential is empty"
-                exec env -i \\
-                    HOME="\$invoker_home" \\
-                    PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
-                    OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
-                    WRAPPER_STAGE=2 \\
-                    setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
-                    "\$INSTALLED_WRAPPER" "\$@"
+
+                # OPENV_PRESERVE_VARS (default unset/empty) — generic,
+                # caller-controlled allowlist of env var NAMES whose current
+                # values are carried THROUGH the \`env -i\` scrub into the final
+                # command. This is the generic mechanism for forwarding a
+                # named secret/setting; the wrapper hard-codes no specific name.
+                # Names are read from the runtime env, comma-separated;
+                # whitespace is trimmed and empty entries are skipped.
+                preserve=()
+                if [ -n "\${OPENV_PRESERVE_VARS:-}" ]; then
+                    IFS=',' read -r -a _openv_names <<< "\$OPENV_PRESERVE_VARS"
+                    for _openv_n in "\${_openv_names[@]}"; do
+                        # Trim leading/trailing whitespace.
+                        _openv_n="\${_openv_n#"\${_openv_n%%[![:space:]]*}"}"
+                        _openv_n="\${_openv_n%"\${_openv_n##*[![:space:]]}"}"
+                        [ -n "\$_openv_n" ] || continue
+                        preserve+=( "\$_openv_n=\$(printenv "\$_openv_n" 2>/dev/null || true)" )
+                    done
+                fi
+
+                if [ "\${OPENV_KEEP_PRIVILEGES:-0}" = "1" ]; then
+                    # OPENV_KEEP_PRIVILEGES=1 — explicit, default-off opt-OUT of
+                    # the drop-to-invoker principle (SPECIFICATION.md
+                    # § Architecture Principles #5). The command runs at the
+                    # wrapper's current uid (root, when reached via sudo) so
+                    # admin tooling can reach root-only resources. No setpriv.
+                    # No \`--\` after the env assignments: uutils/POSIX \`env\`
+                    # reject a GNU-style \`--\` following NAME=value operands.
+                    #
+                    # HOME must be the CURRENT uid's home, NOT the invoker's:
+                    # the child stays root here, and \`op run\` refuses to use a
+                    # config dir under a HOME owned by a different uid ("we
+                    # can't safely access \"\$HOME/.config/op\" because it's not
+                    # owned by the current user"). Resolve the current uid's
+                    # home via getent, falling back to /root.
+                    keep_home="\$(getent passwd "\$(id -u)" | cut -d: -f6)"
+                    [ -n "\$keep_home" ] || keep_home="/root"
+                    exec env -i \\
+                        HOME="\$keep_home" \\
+                        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+                        OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
+                        WRAPPER_STAGE=2 \\
+                        "\${preserve[@]}" \\
+                        "\$INSTALLED_WRAPPER" "\$@"
+                else
+                    # Default: drop privileges back to the *invoker* via setpriv.
+                    # \`env\` has no trailing \`--\` (uutils/POSIX reject it after
+                    # assignments); setpriv keeps ITS OWN \`--\` before the command.
+                    exec env -i \\
+                        HOME="\$invoker_home" \\
+                        PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
+                        OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
+                        WRAPPER_STAGE=2 \\
+                        "\${preserve[@]}" \\
+                        setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
+                        "\$INSTALLED_WRAPPER" "\$@"
+                fi
                 ;;
             2)
                 # Stage 2 — running as the invoker with token in env.
@@ -282,8 +336,14 @@ case "\$(uname -s)" in
                     set -- "\$DEFAULT_SHELL" -i
                 fi
 
+                # Strip the service-account token AND the internal
+                # WRAPPER_STAGE sentinel from the final child env. Unsetting
+                # WRAPPER_STAGE lets one wrapper invoke another without the
+                # inner wrapper inheriting a stale stage and skipping its own
+                # stages. No \`env … --\`: uutils/POSIX reject the GNU \`--\`
+                # after -u options (op's own \`--\` before \`env\` is kept).
                 exec op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
-                    env -u OP_SERVICE_ACCOUNT_TOKEN -- "\$@"
+                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@"
                 ;;
             *)
                 die "unexpected WRAPPER_STAGE: \${WRAPPER_STAGE}"
@@ -311,9 +371,13 @@ case "\$(uname -s)" in
             set -- "\$DEFAULT_SHELL" -i
         fi
 
+        # Strip the service-account token AND the internal WRAPPER_STAGE
+        # sentinel from the final child env, so a nested wrapper invocation
+        # does not inherit a stale stage. No \`env … --\`: uutils/POSIX reject
+        # the GNU \`--\` after assignments/-u options (op's own \`--\` is kept).
         exec env OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
             op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
-            env -u OP_SERVICE_ACCOUNT_TOKEN -- "\$@"
+            env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@"
         ;;
     *)
         die "unsupported platform: \$(uname -s) (only Linux and Darwin are supported)"
