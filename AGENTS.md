@@ -62,6 +62,16 @@ environment ID`.
 - Linux host with **systemd** (`systemctl`, `systemd-creds`),
   `sudo` (GNU sudo, not `sudo-rs` — `-E` / `--preserve-env=` is
   required), and `setpriv` (`util-linux`)
+- A POSIX **`env(1)`** — GNU coreutils OR **uutils coreutils** both
+  work, **because the rendered wrapper deliberately avoids GNU-only
+  `env VAR=val -- cmd`**. Some hosts symlink `/usr/bin/env` to uutils
+  coreutils, whose `env` rejects the `--` separator
+  (`env: '--': No such file or directory` /
+  `use -[v]S to pass options in shebang lines`). When editing the
+  template, keep every `env` invocation `--`-free (use `env VAR=val cmd`);
+  `sudo`'s and `setpriv`'s own `--` are fine, and the render tests assert
+  no `env … --` remains. This portability bug was the first domino in a
+  multi-layer credential-injection failure — do not reintroduce it.
 - An existing Linux **group** named `IDENTIFIER`. (A Linux user
   named `IDENTIFIER` is NOT required — the wrapper drops
   privileges back to the invoker at runtime, not to a separate
@@ -170,6 +180,25 @@ with a dash:
 ```sh
 with-openbrain-env.sh -- ./some-tool --flag value
 ```
+
+### Advanced opt-ins (default-off): `OPENV_KEEP_PRIVILEGES`, `OPENV_PRESERVE_VARS`
+
+Two Linux opt-in env vars — no effect unless set — for admin tooling that must
+reach a root-only resource. They take effect only when the wrapper is invoked via
+an external `sudo -E` (so they survive into the privileged stage). Full contract in
+[`SPECIFICATION.md`](SPECIFICATION.md):
+
+- **`OPENV_KEEP_PRIVILEGES=1`** — skip the default drop-to-invoker; run the child
+  at the current uid (root, when reached via `sudo`). Use only for a child that
+  genuinely needs a root-only resource (e.g. a `0750`-guarded unix socket); set
+  `HOME` is handled to match the kept uid so `op run` doesn't trip its
+  config-dir ownership check.
+- **`OPENV_PRESERVE_VARS="A,B"`** — carry the named caller-set vars through the
+  stage-1 `env -i` scrub into the child, instead of being stripped.
+
+Both stay project-agnostic — the wrapper hard-codes nothing about any consumer.
+Generic example:
+`OPENV_KEEP_PRIVILEGES=1 OPENV_PRESERVE_VARS=SOME_SECRET sudo -E with-<id>-env.sh <admin-command>`.
 
 ## Open an interactive shell via the wrapper
 
