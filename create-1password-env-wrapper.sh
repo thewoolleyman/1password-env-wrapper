@@ -312,16 +312,11 @@ case "\$(uname -s)" in
                     # Default: drop privileges back to the *invoker* via setpriv.
                     # \`env\` has no trailing \`--\` (uutils/POSIX reject it after
                     # assignments); setpriv keeps ITS OWN \`--\` before the command.
-                    # XDG_RUNTIME_DIR is carried through the env -i scrub (set to
-                    # the invoker's /run/user/<uid>) so op's RAM-only cache daemon
-                    # is reachable after the drop, letting Environment reads be
-                    # cached across invocations instead of hitting the rate limit.
                     exec env -i \\
                         HOME="\$invoker_home" \\
                         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
                         OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
                         WRAPPER_STAGE=2 \\
-                        XDG_RUNTIME_DIR="/run/user/\$SUDO_UID" \\
                         "\${preserve[@]}" \\
                         setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
                         "\$INSTALLED_WRAPPER" "\$@"
@@ -335,14 +330,14 @@ case "\$(uname -s)" in
                 # subcommand — only op run --environment.
                 [ -n "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ] || die "stage 2 requires OP_SERVICE_ACCOUNT_TOKEN in env"
                 unset OP_CONNECT_HOST OP_CONNECT_TOKEN
-                # OP_CACHE=true re-enables op's RAM-only, encrypted,
-                # cross-invocation cache (tmpfs under /run/user/\$UID) so repeated
-                # Environment reads are served locally instead of hitting
-                # 1Password on every wrapper call. This is the mitigation for the
-                # account-wide DAILY service-account rate limit shared by all
-                # tenants on the account. The cache is located via
-                # XDG_RUNTIME_DIR, carried through the stage-1 env -i scrub above.
-                export OP_CACHE=true
+                # OP_CACHE=false (original hardening default, kept). op's cache
+                # does NOT cover \`op run --environment\` resolution — verified by
+                # measuring the service-account rate-limit counter across repeated
+                # identical resolutions: consumption is identical with caching on
+                # or off. So caching is NOT a rate-limit mitigation here; the real
+                # levers are call-volume reduction and the account tier. (The
+                # op-exit-9 clause below makes a rate-limit failure legible.)
+                export OP_CACHE=false
 
                 if [ "\$#" -eq 0 ]; then
                     set -- "\$DEFAULT_SHELL" -i
@@ -389,11 +384,10 @@ case "\$(uname -s)" in
         fi
         [ -n "\$token" ] || die "macOS Keychain entry is empty (service: \$MACOS_KEYCHAIN_SERVICE)"
         unset OP_CONNECT_HOST OP_CONNECT_TOKEN
-        # OP_CACHE=true: re-enable op's encrypted in-session cache (parity with
-        # Linux) so repeated Environment reads are served locally rather than
-        # hitting the shared account-wide daily rate limit. macOS caches in the
-        # login session, so no XDG_RUNTIME_DIR carry-through is needed.
-        export OP_CACHE=true
+        # OP_CACHE=false (parity with Linux): op does not cache
+        # \`op run --environment\` resolution, so caching is no rate-limit
+        # mitigation; the original hardening default is kept.
+        export OP_CACHE=false
 
         if [ "\$#" -eq 0 ]; then
             set -- "\$DEFAULT_SHELL" -i
