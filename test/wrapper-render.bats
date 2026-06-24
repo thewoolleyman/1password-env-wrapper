@@ -142,6 +142,33 @@ build_preserve() {
 }
 
 # ---------------------------------------------------------------------------
+# Cache + rate-limit legibility (rate-limit mitigation).
+# ---------------------------------------------------------------------------
+
+@test "stage-2 ENABLES op's cache (OP_CACHE=true) on both platforms, never disables it" {
+    # Caching is the mitigation for the shared account-wide daily rate limit;
+    # the wrapper must no longer force it off.
+    ! grep -Fq 'OP_CACHE=false' "$RENDERED"
+    run grep -cF 'export OP_CACHE=true' "$RENDERED"
+    [ "$output" -eq 2 ]
+}
+
+@test "default drop branch carries XDG_RUNTIME_DIR so op's cache daemon is reachable" {
+    # The env -i scrub would otherwise strip XDG_RUNTIME_DIR, leaving op unable
+    # to find its per-user cache daemon after the setpriv drop to the invoker.
+    grep -Fq 'XDG_RUNTIME_DIR="/run/user/$SUDO_UID"' "$RENDERED"
+}
+
+@test "a 1Password rate limit (op exit 9) is made legible and propagated on both platforms" {
+    # Both Stage-2 paths branch on op exit 9 (no exec) and re-propagate the code.
+    run grep -cF '[ "$rc" -eq 9 ]' "$RENDERED"
+    [ "$output" -eq 2 ]
+    run grep -cF 'exit "$rc"' "$RENDERED"
+    [ "$output" -eq 2 ]
+    grep -Fq 'rate limit' "$RENDERED"
+}
+
+# ---------------------------------------------------------------------------
 # Feature A — OPENV_KEEP_PRIVILEGES (default-off opt-out of drop-to-invoker).
 # ---------------------------------------------------------------------------
 
