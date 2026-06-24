@@ -140,13 +140,14 @@ and no privilege drop**:
 1. `security find-generic-password -s "<IDENTIFIER>" -a
    "OP_SERVICE_ACCOUNT_TOKEN" -w` retrieves the token from the
    per-user login Keychain into a memory variable.
-2. `unset OP_CONNECT_HOST OP_CONNECT_TOKEN; export OP_CACHE=true`
-   (parity with the Linux Stage-2 path). `OP_CACHE=true` re-enables
-   op's encrypted, in-session cache so repeated Environment reads are
-   served locally rather than counting against 1Password's
-   service-account rate limits. The cache holds no plaintext on disk;
-   on macOS it lives in the login session, so — unlike Linux — no
-   `XDG_RUNTIME_DIR` carry-through is required.
+2. `unset OP_CONNECT_HOST OP_CONNECT_TOKEN; export OP_CACHE=false`
+   (parity with the Linux Stage-2 path, original hardening default).
+   op's cache does **not** cover `op run --environment` resolution —
+   verified by measuring the service-account rate-limit counter across
+   repeated identical resolutions: consumption is identical with caching
+   on or off. Caching is therefore **not** a rate-limit mitigation here,
+   and no `XDG_RUNTIME_DIR` carry-through is needed. The real levers are
+   reducing call volume and the account tier.
 3. `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
    -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"`, run via
    `env OP_SERVICE_ACCOUNT_TOKEN="$token"` and NOT `exec`ed (so op's
@@ -699,14 +700,14 @@ covers all three:
    wrapper SHALL:
    - `unset OP_CONNECT_HOST OP_CONNECT_TOKEN` so 1Password Connect
      does not override `OP_SERVICE_ACCOUNT_TOKEN`;
-   - export `OP_CACHE=true` — re-enable op's encrypted, RAM-only
-     (tmpfs `/run/user/<uid>`), cross-invocation cache so repeated
-     Environment reads are served locally instead of counting against
-     1Password's service-account rate limits. So op can locate the
-     per-user cache daemon after the privilege drop, Stage 1's
-     drop-to-invoker `env -i` SHALL carry `XDG_RUNTIME_DIR`
-     (`/run/user/<SUDO_UID>`) through the scrub. The cache writes no
-     plaintext to disk;
+   - export `OP_CACHE=false` (original hardening default). op's cache
+     does **not** cover `op run --environment` resolution — verified by
+     measuring the service-account rate-limit counter across repeated
+     identical resolutions: consumption is identical with caching on or
+     off. Caching is therefore **not** a rate-limit mitigation here, so
+     it is left off and no `XDG_RUNTIME_DIR` carry-through is added. The
+     real rate-limit levers are reducing call volume and the account
+     tier;
    - run `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
      -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE <command>`
      so the final child sees neither the service-account token nor
@@ -747,14 +748,15 @@ message (but no secret values) when:
 When the child command runs, the wrapper SHALL propagate the child's
 exit code as its own exit code.
 
-When `op run` exits `9` — the status op returns when it cannot
-resolve the Environment because the service-account rate limit is
-exhausted (message `…rate limit exceeded`) — the wrapper SHALL emit a
-diagnostic (no secret values) explaining that the account-wide DAILY
-quota is shared across every tenant on the 1Password account and
-resets on a ~24h window (per-token HOURLY limits reset ~59m), so a
-short retry will not clear it. The wrapper SHALL still propagate op's
-exit code unchanged. Because the wrapper branches on the exit code
+When `op run` exits `9` — op's status for a failed Environment
+operation, of which an exhausted service-account rate limit (message
+`…rate limit exceeded`) is the common case (a transient backend error
+returns `9` too) — the wrapper SHALL emit a hedged diagnostic (no
+secret values) noting that the account-wide DAILY quota is shared
+across every tenant on the 1Password account and resets on a ~24h
+window (per-token HOURLY limits reset ~59m), so a short retry will not
+clear a rate-limit case. The wrapper SHALL still propagate op's exit
+code unchanged. Because the wrapper branches on the exit code
 alone (it never captures op's or the child's output, which may carry
 secrets under `--no-masking`), an unrelated child that itself exits
 `9` will also surface this diagnostic; the wording is hedged
