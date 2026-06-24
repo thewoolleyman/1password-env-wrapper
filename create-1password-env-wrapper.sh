@@ -312,11 +312,16 @@ case "\$(uname -s)" in
                     # Default: drop privileges back to the *invoker* via setpriv.
                     # \`env\` has no trailing \`--\` (uutils/POSIX reject it after
                     # assignments); setpriv keeps ITS OWN \`--\` before the command.
+                    # XDG_RUNTIME_DIR is carried through the env -i scrub (set to
+                    # the invoker's /run/user/<uid>) so op's RAM-only cache daemon
+                    # is reachable after the drop, letting Environment reads be
+                    # cached across invocations instead of hitting the rate limit.
                     exec env -i \\
                         HOME="\$invoker_home" \\
                         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
                         OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
                         WRAPPER_STAGE=2 \\
+                        XDG_RUNTIME_DIR="/run/user/\$SUDO_UID" \\
                         "\${preserve[@]}" \\
                         setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
                         "\$INSTALLED_WRAPPER" "\$@"
@@ -330,7 +335,14 @@ case "\$(uname -s)" in
                 # subcommand — only op run --environment.
                 [ -n "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ] || die "stage 2 requires OP_SERVICE_ACCOUNT_TOKEN in env"
                 unset OP_CONNECT_HOST OP_CONNECT_TOKEN
-                export OP_CACHE=false
+                # OP_CACHE=true re-enables op's RAM-only, encrypted,
+                # cross-invocation cache (tmpfs under /run/user/\$UID) so repeated
+                # Environment reads are served locally instead of hitting
+                # 1Password on every wrapper call. This is the mitigation for the
+                # account-wide DAILY service-account rate limit shared by all
+                # tenants on the account. The cache is located via
+                # XDG_RUNTIME_DIR, carried through the stage-1 env -i scrub above.
+                export OP_CACHE=true
 
                 if [ "\$#" -eq 0 ]; then
                     set -- "\$DEFAULT_SHELL" -i
@@ -342,8 +354,20 @@ case "\$(uname -s)" in
                 # inner wrapper inheriting a stale stage and skipping its own
                 # stages. No \`env … --\`: uutils/POSIX reject the GNU \`--\`
                 # after -u options (op's own \`--\` before \`env\` is kept).
-                exec op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
-                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@"
+                # Do NOT exec op here: observe op's exit status so a 1Password
+                # rate-limit failure is legible. op exits 9 when it cannot resolve
+                # the Environment because the service-account quota is exhausted
+                # (the message is "...rate limit exceeded"). On every other outcome
+                # op's exit code is propagated unchanged (the child's own code when
+                # it ran). We never capture op/child output — it can carry secrets
+                # under --no-masking — so we branch on the exit code alone.
+                rc=0
+                op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
+                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
+                if [ "\$rc" -eq 9 ]; then
+                    err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait, or cut op-run frequency. See https://www.1password.dev/service-accounts/rate-limits/"
+                fi
+                exit "\$rc"
                 ;;
             *)
                 die "unexpected WRAPPER_STAGE: \${WRAPPER_STAGE}"
@@ -365,7 +389,11 @@ case "\$(uname -s)" in
         fi
         [ -n "\$token" ] || die "macOS Keychain entry is empty (service: \$MACOS_KEYCHAIN_SERVICE)"
         unset OP_CONNECT_HOST OP_CONNECT_TOKEN
-        export OP_CACHE=false
+        # OP_CACHE=true: re-enable op's encrypted in-session cache (parity with
+        # Linux) so repeated Environment reads are served locally rather than
+        # hitting the shared account-wide daily rate limit. macOS caches in the
+        # login session, so no XDG_RUNTIME_DIR carry-through is needed.
+        export OP_CACHE=true
 
         if [ "\$#" -eq 0 ]; then
             set -- "\$DEFAULT_SHELL" -i
@@ -375,9 +403,17 @@ case "\$(uname -s)" in
         # sentinel from the final child env, so a nested wrapper invocation
         # does not inherit a stale stage. No \`env … --\`: uutils/POSIX reject
         # the GNU \`--\` after assignments/-u options (op's own \`--\` is kept).
-        exec env OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
+        # Do NOT exec op here (see the Linux Stage-2 note): observe op's exit
+        # code so a 1Password rate-limit (op exit 9) is legible, while still
+        # propagating the code unchanged. No output is captured (may hold secrets).
+        rc=0
+        env OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
             op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
-            env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@"
+            env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
+        if [ "\$rc" -eq 9 ]; then
+            err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait. See https://www.1password.dev/service-accounts/rate-limits/"
+        fi
+        exit "\$rc"
         ;;
     *)
         die "unsupported platform: \$(uname -s) (only Linux and Darwin are supported)"

@@ -140,15 +140,22 @@ and no privilege drop**:
 1. `security find-generic-password -s "<IDENTIFIER>" -a
    "OP_SERVICE_ACCOUNT_TOKEN" -w` retrieves the token from the
    per-user login Keychain into a memory variable.
-2. `unset OP_CONNECT_HOST OP_CONNECT_TOKEN; export OP_CACHE=false`
-   (parity with the Linux Stage-2 hardening).
-3. `exec env OP_SERVICE_ACCOUNT_TOKEN="$token" op run
-   --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID> -- env
-   -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"` so the final
-   child sees neither the token nor the internal `WRAPPER_STAGE`
-   sentinel (the latter so a nested wrapper invocation re-runs its
-   own stages). The inner `env -u …` uses no GNU `--` separator, so
-   a POSIX/uutils `env` accepts it; op's own `--` is retained. The
+2. `unset OP_CONNECT_HOST OP_CONNECT_TOKEN; export OP_CACHE=true`
+   (parity with the Linux Stage-2 path). `OP_CACHE=true` re-enables
+   op's encrypted, in-session cache so repeated Environment reads are
+   served locally rather than counting against 1Password's
+   service-account rate limits. The cache holds no plaintext on disk;
+   on macOS it lives in the login session, so — unlike Linux — no
+   `XDG_RUNTIME_DIR` carry-through is required.
+3. `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
+   -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"`, run via
+   `env OP_SERVICE_ACCOUNT_TOKEN="$token"` and NOT `exec`ed (so op's
+   exit status can be observed — see the rate-limit clause below), so
+   the final child sees neither the token nor the internal
+   `WRAPPER_STAGE` sentinel (the latter so a nested wrapper invocation
+   re-runs its own stages). The inner `env -u …` uses no GNU `--`
+   separator, so a POSIX/uutils `env` accepts it; op's own `--` is
+   retained. The
    `OPENV_KEEP_PRIVILEGES` and `OPENV_PRESERVE_VARS` opt-ins are
    inert on macOS: there is no privilege escalation to keep and no
    `env -i` scrub to carry variables through (caller variables
@@ -692,8 +699,15 @@ covers all three:
    wrapper SHALL:
    - `unset OP_CONNECT_HOST OP_CONNECT_TOKEN` so 1Password Connect
      does not override `OP_SERVICE_ACCOUNT_TOKEN`;
-   - export `OP_CACHE=false`;
-   - exec `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
+   - export `OP_CACHE=true` — re-enable op's encrypted, RAM-only
+     (tmpfs `/run/user/<uid>`), cross-invocation cache so repeated
+     Environment reads are served locally instead of counting against
+     1Password's service-account rate limits. So op can locate the
+     per-user cache daemon after the privilege drop, Stage 1's
+     drop-to-invoker `env -i` SHALL carry `XDG_RUNTIME_DIR`
+     (`/run/user/<SUDO_UID>`) through the scrub. The cache writes no
+     plaintext to disk;
+   - run `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
      -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE <command>`
      so the final child sees neither the service-account token nor
      the internal `WRAPPER_STAGE` sentinel. Stripping `WRAPPER_STAGE`
@@ -701,7 +715,10 @@ covers all three:
      inner wrapper inheriting a stale stage and skipping its own
      stages. As with Stage 1's `env -i`, this `env -u …` invocation
      uses no GNU-style `--` after its options (op's own `--`, which
-     separates `op run` arguments from the child command, is kept);
+     separates `op run` arguments from the child command, is kept).
+     The wrapper SHALL NOT `exec` op: it runs op as a child so op's
+     exit status is observable (see the rate-limit clause below),
+     then propagates that exit code unchanged;
    - when no command was supplied, run `DEFAULT_SHELL -i` instead.
 
 The wrapper SHALL NOT call `op item list`, `op item get`, `op read`,
@@ -729,6 +746,19 @@ message (but no secret values) when:
 
 When the child command runs, the wrapper SHALL propagate the child's
 exit code as its own exit code.
+
+When `op run` exits `9` — the status op returns when it cannot
+resolve the Environment because the service-account rate limit is
+exhausted (message `…rate limit exceeded`) — the wrapper SHALL emit a
+diagnostic (no secret values) explaining that the account-wide DAILY
+quota is shared across every tenant on the 1Password account and
+resets on a ~24h window (per-token HOURLY limits reset ~59m), so a
+short retry will not clear it. The wrapper SHALL still propagate op's
+exit code unchanged. Because the wrapper branches on the exit code
+alone (it never captures op's or the child's output, which may carry
+secrets under `--no-masking`), an unrelated child that itself exits
+`9` will also surface this diagnostic; the wording is hedged
+accordingly.
 
 ### Environment Variable Contract
 
