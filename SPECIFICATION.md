@@ -708,7 +708,8 @@ covers all three:
      it is left off and no `XDG_RUNTIME_DIR` carry-through is added. The
      real rate-limit levers are reducing call volume and the account
      tier;
-   - run `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
+   - **when the TTL cache (below) is disabled or misses**, run
+     `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
      -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE <command>`
      so the final child sees neither the service-account token nor
      the internal `WRAPPER_STAGE` sentinel. Stripping `WRAPPER_STAGE`
@@ -719,7 +720,10 @@ covers all three:
      separates `op run` arguments from the child command, is kept).
      The wrapper SHALL NOT `exec` op: it runs op as a child so op's
      exit status is observable (see the rate-limit clause below),
-     then propagates that exit code unchanged;
+     then propagates that exit code unchanged. **When the TTL cache is
+     enabled and hits, or freshly resolves on a miss, the wrapper
+     launches the command itself instead** — see "TTL cache of the
+     op-resolved environment" below for the full contract;
    - when no command was supplied, run `DEFAULT_SHELL -i` instead.
 
 The wrapper SHALL NOT call `op item list`, `op item get`, `op read`,
@@ -759,8 +763,88 @@ clear a rate-limit case. The wrapper SHALL still propagate op's exit
 code unchanged. Because the wrapper branches on the exit code
 alone (it never captures op's or the child's output, which may carry
 secrets under `--no-masking`), an unrelated child that itself exits
-`9` will also surface this diagnostic; the wording is hedged
-accordingly.
+`9` will also surface this diagnostic on the **uncached path**, where
+op runs the real command as its own child; the wording is hedged
+accordingly. On the TTL cache's populate-resolve call (below), op's
+target is always an introspection command rather than the real
+command, so an exit-9 there is unambiguously a genuine Environment
+resolution failure.
+
+### TTL cache of the op-resolved environment (Linux)
+
+`op run --environment` itself costs real CPU time on every
+invocation regardless of `OP_CACHE` (see the note above — op's own
+cache does not cover Environment resolution). Stage 2 additionally
+maintains a **wrapper-level** TTL cache of the *resolved variables*
+— distinct from and unrelated to op's own `OP_CACHE` — so a repeated
+invocation of the same installed wrapper can skip calling `op`
+entirely.
+
+- The cache is controlled by `OP_ENV_WRAPPER_CACHE_TTL` (seconds,
+  default `300`). `OP_ENV_WRAPPER_CACHE_TTL=0` SHALL disable caching
+  entirely: the wrapper SHALL behave exactly as the uncached path
+  described above. A malformed (non-numeric) value SHALL be treated
+  as `0` — fail open on a misconfigured TTL, never fail closed.
+- Because sudo's default `env_reset` strips the caller's ambient
+  environment during Stage 0's escalation, and each Stage 1 branch
+  re-execs Stage 2 through a clean `env -i`, `OP_ENV_WRAPPER_CACHE_TTL`
+  SHALL be threaded explicitly through both hops (the same technique
+  already used for `WRAPPER_STAGE`), so a caller's override —
+  including `=0` — reaches Stage 2 on the normal, non-privileged
+  invocation path, not only when the caller already invoked via an
+  external `sudo -E`.
+- Storage: the invoking user's kernel keyring (`keyctl`, the `@u`
+  user keyring, scoped by real uid — the uid Stage 2 always runs as
+  after the `setpriv` drop, or root's own uid under
+  `OPENV_KEEP_PRIVILEGES=1`). Kernel keyring entries live only in
+  kernel memory (never touch disk), are readable only by that uid's
+  own processes (and root), and `keyctl timeout` gives the **kernel**
+  itself an expiry, so an expired entry is simply gone rather than
+  stale data the wrapper must remember to distrust. This was chosen
+  over a systemd-creds file specifically because systemd-creds has no
+  built-in TTL and decrypts into root-owned state — the wrong shape
+  for a short-lived, per-invoker cache the invoker's own unprivileged
+  process must cheaply read back itself.
+- `keyctl` (the `keyutils` package) is a **soft** dependency: when it
+  is not on `PATH`, the wrapper SHALL skip the cache entirely and run
+  the uncached path. The wrapper's functional correctness never
+  depends on `keyutils` being installed; the installer does not add
+  it as a prerequisite.
+- On a cache **hit**, the wrapper SHALL replay only the previously
+  cached variables on top of the invoker's *current* ambient
+  environment — never a stale snapshot of the whole environment — so
+  a hit still honors the "1Password value wins" override rule below
+  without clobbering unrelated variables the caller set between
+  invocations.
+- On a cache **miss**, Stage 2 SHALL resolve the Environment via
+  **exactly one** `op run --no-masking --environment <ID> -- env -u
+  OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE` call whose target is an
+  introspection command (`env`), not the real command, so the
+  wrapper can diff the result against a pre-op baseline snapshot of
+  its own environment and learn exactly which variables op injected
+  or overrode. Only that diff is written to the cache; the real
+  command is then launched directly by the wrapper itself (never as
+  a child of `op`) with the diff applied on top of the current
+  environment. A cache miss therefore costs the same single `op run`
+  call the uncached path costs today — caching never doubles op
+  invocations.
+- If computing the diff fails — in practice, because a resolved
+  value contains a literal newline, which this line-oriented cache
+  format cannot represent unambiguously (for example, a multi-line
+  PEM private key stored as an Environment value) — the wrapper SHALL
+  NOT write to the cache for that invocation and SHALL fall through
+  to the uncached path. An Environment containing only single-line
+  values (the common case: tokens, connection strings, API keys) is
+  fully cacheable; an Environment with any multi-line value is always
+  served correctly but never benefits from caching.
+- A cache miss or **any** cache-path anomaly (a missing `keyctl`
+  binary, a malformed or unreadable cache entry, a diff/parse
+  failure) SHALL fall open to the uncached `op run` path — never to
+  a broken or incorrect result.
+- Both the cached-replay exec and the freshly-resolved-on-miss exec
+  SHALL strip `OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` from the
+  child exactly as the uncached path does, per the Environment
+  Variable Contract below.
 
 ### Environment Variable Contract
 
@@ -787,6 +871,12 @@ accordingly.
   also defines a variable of the same name (in which case the
   1Password value wins, per the override rule above). `OPENV_*`
   control variables themselves are not injected into the child.
+- `OP_ENV_WRAPPER_CACHE_TTL` (see "TTL cache of the op-resolved
+  environment" above) is likewise a wrapper control variable: whether
+  a given variable reached the child from a live `op run` resolution
+  or from the TTL cache, the same override rule above applies
+  identically — a cache hit never changes what the child sees for a
+  fixed Environment state.
 
 ## Test Target: `print-test-env-vars.sh`
 
@@ -1311,6 +1401,32 @@ And the configured 1Password Environment has `SUPABASE_URL=correct`
 When `openbrain` runs `with-openbrain-env.sh printenv SUPABASE_URL`
 
 Then the command prints `correct`
+
+### Scenario: TTL cache serves a repeated invocation without calling op
+
+Given `openbrain`'s configured Environment contains only single-line
+values, and `OP_ENV_WRAPPER_CACHE_TTL` is unset (default 300s)
+
+When `openbrain` runs `with-openbrain-env.sh printenv TEST_FOO` twice
+in immediate succession
+
+Then the first invocation resolves via `op run --environment` and
+populates the kernel keyring cache
+
+And the second invocation prints the identical value without
+invoking `op` at all
+
+And both invocations still omit `OP_SERVICE_ACCOUNT_TOKEN` and
+`WRAPPER_STAGE` from the child process
+
+### Scenario: OP_ENV_WRAPPER_CACHE_TTL=0 disables caching
+
+Given `openbrain` runs `OP_ENV_WRAPPER_CACHE_TTL=0
+with-openbrain-env.sh printenv TEST_FOO` twice in immediate succession
+
+Then both invocations resolve via `op run --environment`
+
+And no kernel keyring entry is created for either invocation
 
 ### Scenario: Missing 1Password access fails closed
 

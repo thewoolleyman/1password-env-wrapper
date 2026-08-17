@@ -124,7 +124,17 @@ build_preserve() {
 
 @test "sudo self-escalation keeps its own -- separator" {
     # sudo supports `--`; it must stay.
-    grep -Fq '"$sudo_path" -n WRAPPER_STAGE=1 -- "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
+    grep -Fq '"$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="${OP_ENV_WRAPPER_CACHE_TTL:-}" -- "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
+}
+
+@test "OP_ENV_WRAPPER_CACHE_TTL is threaded through the sudo hop and both stage-1 env -i re-execs" {
+    # Otherwise a caller's override (including =0 to disable caching) would
+    # silently revert to the built-in default for the common, non-root
+    # invocation path, since sudo's env_reset strips unlisted vars and each
+    # stage-1 branch re-execs stage 2 through a clean env -i.
+    grep -Fq 'OP_ENV_WRAPPER_CACHE_TTL="${OP_ENV_WRAPPER_CACHE_TTL:-}"' "$RENDERED"
+    run grep -cF 'OP_ENV_WRAPPER_CACHE_TTL="${OP_ENV_WRAPPER_CACHE_TTL:-}"' "$RENDERED"
+    [ "$output" -eq 3 ]
 }
 
 @test "setpriv keeps its own -- separator in the default drop branch" {
@@ -298,6 +308,136 @@ default_drop_branch() {
     OPENV_PRESERVE_VARS='OPENV_DOES_NOT_EXIST' build_preserve
     [ "${#preserve[@]}" -eq 1 ]
     [ "${preserve[0]}" = "OPENV_DOES_NOT_EXIST=" ]
+}
+
+# ---------------------------------------------------------------------------
+# Feature C — TTL cache of the op-resolved environment
+# (OP_ENV_WRAPPER_CACHE_TTL). See SPECIFICATION.md § "TTL cache of the
+# op-resolved environment" for the full design.
+# ---------------------------------------------------------------------------
+
+@test "cache is gated on OP_ENV_WRAPPER_CACHE_TTL (default 300s) and keyctl availability" {
+    grep -Fq 'cache_ttl="${OP_ENV_WRAPPER_CACHE_TTL:-300}"' "$RENDERED"
+    grep -Fq 'if [ "$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1; then' "$RENDERED"
+}
+
+@test "a malformed OP_ENV_WRAPPER_CACHE_TTL is normalized to 0 (disabled), not a crash" {
+    grep -Fq "''|*[!0-9]*) cache_ttl=0 ;;" "$RENDERED"
+}
+
+@test "cache key is scoped to the user keyring (@u) by IDENTIFIER + Environment ID" {
+    grep -Fq 'cache_desc="op-env-wrapper-cache:${IDENTIFIER}:${ONEPASSWORD_ENVIRONMENT_ID}"' "$RENDERED"
+    grep -Fq 'keyctl search @u user "$cache_desc"' "$RENDERED"
+    grep -Fq 'keyctl padd user "$cache_desc" @u' "$RENDERED"
+    grep -Fq 'keyctl timeout "$new_key_id" "$cache_ttl"' "$RENDERED"
+}
+
+@test "both cache-path child execs strip OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE" {
+    # One for the cache-hit replay, one for the freshly-resolved cache-miss
+    # launch — both bypass op entirely for the child, so both must repeat
+    # the same -u strip the uncached op-run path gets from op's own env -u.
+    run grep -cF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign[@]}" "$@"' "$RENDERED"
+    [ "$output" -eq 2 ]
+}
+
+@test "a cache miss resolves via an introspection target (env), never the real command, under op" {
+    grep -Fq 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE' "$RENDERED"
+}
+
+@test "a rate limit (op exit 9) on the cache-populate resolve exits before the child ever runs" {
+    grep -Fq 'op_rc=$?' "$RENDERED"
+    grep -Fq '[ "$op_rc" -eq 9 ]' "$RENDERED"
+    grep -Fq 'exit "$op_rc"' "$RENDERED"
+}
+
+# The exact NAME=VALUE line-parsing + baseline-diff logic from the wrapper
+# template's stage-2 cache-miss path (first-'='-split, malformed-line
+# detection, "only what changed vs. baseline" diff), lifted verbatim so the
+# test exercises the real algorithm. Keep this in sync with the
+# `base_map` / `assign` / `injected` / `parse_ok` block in
+# create-1password-env-wrapper.sh.
+diff_injected_vars() {
+    local baseline_raw="$1" resolved_raw="$2"
+    local -A base_map=()
+    while IFS= read -r line; do
+        case "$line" in
+            [A-Za-z_]*=*) base_map["${line%%=*}"]="${line#*=}" ;;
+        esac
+    done <<< "$baseline_raw"
+
+    assign=()
+    injected=()
+    parse_ok=1
+    while IFS= read -r line; do
+        case "$line" in
+            [A-Za-z_]*=*)
+                assign+=("$line")
+                local name="${line%%=*}"
+                local value="${line#*=}"
+                if [ "${base_map[$name]+set}" != "set" ] || [ "${base_map[$name]}" != "$value" ]; then
+                    injected+=("$line")
+                fi
+                ;;
+            *) parse_ok=0; break ;;
+        esac
+    done <<< "$resolved_raw"
+}
+
+@test "diff: a var absent from baseline is injected" {
+    diff_injected_vars $'PATH=/bin' $'PATH=/bin\nTEST_FOO=hello'
+    [ "$parse_ok" -eq 1 ]
+    [ "${#injected[@]}" -eq 1 ]
+    [ "${injected[0]}" = "TEST_FOO=hello" ]
+    [ "${#assign[@]}" -eq 2 ]
+}
+
+@test "diff: a var unchanged from baseline is NOT re-cached (only the delta is)" {
+    diff_injected_vars $'PATH=/bin\nSAME=1' $'PATH=/bin\nSAME=1'
+    [ "$parse_ok" -eq 1 ]
+    [ "${#injected[@]}" -eq 0 ]
+}
+
+@test "diff: a var overridden by 1Password IS injected with the new (winning) value" {
+    diff_injected_vars $'AMBIENT=original' $'AMBIENT=overridden'
+    [ "$parse_ok" -eq 1 ]
+    [ "${#injected[@]}" -eq 1 ]
+    [ "${injected[0]}" = "AMBIENT=overridden" ]
+}
+
+@test "diff: a resolved line that is not NAME=VALUE sets parse_ok=0 (fail open to uncached path)" {
+    diff_injected_vars $'PATH=/bin' $'PATH=/bin\nnot a valid assignment line'
+    [ "$parse_ok" -eq 0 ]
+}
+
+# ---------------------------------------------------------------------------
+# Live keyctl round-trip. Skipped when keyutils is not installed — the
+# structural gate test above proves the wrapper fails open (uncached) in
+# that case, so this is extra assurance where the host allows it, not a
+# hard requirement of the feature.
+# ---------------------------------------------------------------------------
+
+@test "live: keyctl round-trip stores, replays, and expires the cached diff" {
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    local desc="wrapper-render-bats-test:$$"
+    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
+
+    local key_id
+    key_id="$(printf '%s\n' 'TEST_FOO=hello' 'TEST_BAR=world' | keyctl padd user "$desc" @u)"
+    keyctl timeout "$key_id" 2
+
+    local found_id
+    found_id="$(keyctl search @u user "$desc")"
+    [ "$found_id" = "$key_id" ]
+    run keyctl pipe "$found_id"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"TEST_FOO=hello"* ]]
+    [[ "$output" == *"TEST_BAR=world"* ]]
+
+    sleep 3
+    run keyctl search @u user "$desc"
+    [ "$status" -ne 0 ]
 }
 
 # Tiny local assertion helper so this file does not depend on
