@@ -194,6 +194,12 @@ readonly MACOS_KEYCHAIN_TOKEN_ACCOUNT='${MACOS_KEYCHAIN_TOKEN_ACCOUNT}'
 PROG="\$(basename -- "\$0")"
 err()  { printf '%s: %s\n' "\$PROG" "\$*" >&2; }
 die()  { err "\$@"; exit 1; }
+# Shared diagnostic for op's exit code 9 (failed Environment resolution,
+# most commonly an exhausted service-account rate limit). Reused by every
+# op-run call site below (Linux stage 2's cache-populate resolve and its
+# uncached fallback, and the macOS single-stage path) so the wording lives
+# in exactly one place.
+op_rate_limit_hint() { err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait, or cut op-run frequency. See https://www.1password.dev/service-accounts/rate-limits/"; }
 
 # Drop -- separator if present.
 if [ "\$#" -gt 0 ] && [ "\$1" = "--" ]; then
@@ -237,7 +243,17 @@ case "\$(uname -s)" in
                 if ! sudo_path="\$(command -v sudo)"; then
                     die "sudo not found on PATH; required to escalate for credential decryption"
                 fi
-                exec "\$sudo_path" -n WRAPPER_STAGE=1 -- "\$INSTALLED_WRAPPER" "\$@"
+                # Thread OP_ENV_WRAPPER_CACHE_TTL through explicitly: sudo's
+                # default env_reset strips the caller's ambient environment
+                # here (the sudoers SETENV tag permits an override, it does
+                # not imply preservation), so without this, a caller's
+                # OP_ENV_WRAPPER_CACHE_TTL — including =0 to disable caching
+                # — would silently fall back to the built-in default on every
+                # invocation that reaches here (the common, non-root path).
+                # \${VAR:-} degrades a genuinely-unset caller value to an
+                # empty string, which stage 2's \${...:-300} default treats
+                # the same as unset.
+                exec "\$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" -- "\$INSTALLED_WRAPPER" "\$@"
                 ;;
             1)
                 # Stage 1 — running as root. Decrypt the credential into memory,
@@ -306,6 +322,7 @@ case "\$(uname -s)" in
                         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
                         OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
                         WRAPPER_STAGE=2 \\
+                        OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" \\
                         "\${preserve[@]}" \\
                         "\$INSTALLED_WRAPPER" "\$@"
                 else
@@ -317,6 +334,7 @@ case "\$(uname -s)" in
                         PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \\
                         OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
                         WRAPPER_STAGE=2 \\
+                        OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" \\
                         "\${preserve[@]}" \\
                         setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
                         "\$INSTALLED_WRAPPER" "\$@"
@@ -343,6 +361,114 @@ case "\$(uname -s)" in
                     set -- "\$DEFAULT_SHELL" -i
                 fi
 
+                # ---------------------------------------------------------------
+                # TTL cache of the op-RESOLVED VARIABLES (not op's own cache —
+                # see the OP_CACHE note above; this is a wrapper-level cache
+                # that lets a repeated invocation skip calling op at all).
+                # Opt out per-call with OP_ENV_WRAPPER_CACHE_TTL=0; default TTL
+                # is 300s, overridable with the same variable.
+                #
+                # Storage: the invoking user's kernel keyring (\`@u\`, scoped by
+                # real uid — the same uid stage 2 always runs as after the
+                # setpriv drop, or root's own uid under OPENV_KEEP_PRIVILEGES=1).
+                # Chosen over a systemd-creds file because keyring entries live
+                # only in kernel memory (never touch disk), are readable only by
+                # that uid's own processes (and root), and \`keyctl timeout\`
+                # gives the KERNEL an expiry, so an expired entry is simply gone
+                # rather than stale data this script has to remember to distrust.
+                #
+                # Only the variables op run actually injects are cached — never
+                # the wrapper's whole ambient environment — so a cache hit can
+                # never replay a stale snapshot of unrelated caller-set
+                # variables into a later invocation; it only re-forces the same
+                # 1Password-sourced values a live \`op run\` would have produced
+                # (per the "1Password value wins" override rule below). Any
+                # cache miss or cache-path anomaly falls through unchanged to
+                # the uncached op-run path.
+                # ---------------------------------------------------------------
+                cache_ttl="\${OP_ENV_WRAPPER_CACHE_TTL:-300}"
+                case "\$cache_ttl" in
+                    ''|*[!0-9]*) cache_ttl=0 ;;  # malformed -> disabled, fail open
+                esac
+
+                if [ "\$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1; then
+                    cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}"
+
+                    # --- cache hit? ---
+                    if key_id="\$(keyctl search @u user "\$cache_desc" 2>/dev/null)" \\
+                            && cached_raw="\$(keyctl pipe "\$key_id" 2>/dev/null)" \\
+                            && [ -n "\$cached_raw" ]; then
+                        assign=()
+                        cache_ok=1
+                        while IFS= read -r line; do
+                            case "\$line" in
+                                [A-Za-z_]*=*) assign+=("\$line") ;;
+                                *) cache_ok=0; break ;;
+                            esac
+                        done <<< "\$cached_raw"
+                        if [ "\$cache_ok" -eq 1 ] && [ "\${#assign[@]}" -gt 0 ]; then
+                            exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                        fi
+                        # Malformed cache entry (should not happen — treat as
+                        # a miss and fall through to resolve fresh below).
+                    fi
+
+                    # --- cache miss: resolve via an introspection target
+                    # (\`env\`, not the real command) so we learn exactly which
+                    # variables op injected, cache that diff, then launch the
+                    # real command ourselves. This is the ONLY \`op run\` call
+                    # on a cache miss — the real command never runs under op.
+                    baseline_raw="\$(env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"
+                    if resolved_raw="\$(op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"; then
+                        declare -A base_map=()
+                        while IFS= read -r line; do
+                            case "\$line" in
+                                [A-Za-z_]*=*) base_map["\${line%%=*}"]="\${line#*=}" ;;
+                            esac
+                        done <<< "\$baseline_raw"
+
+                        assign=()
+                        injected=()
+                        parse_ok=1
+                        while IFS= read -r line; do
+                            case "\$line" in
+                                [A-Za-z_]*=*)
+                                    assign+=("\$line")
+                                    name="\${line%%=*}"
+                                    value="\${line#*=}"
+                                    if [ "\${base_map[\$name]+set}" != "set" ] || [ "\${base_map[\$name]}" != "\$value" ]; then
+                                        injected+=("\$line")
+                                    fi
+                                    ;;
+                                *) parse_ok=0; break ;;
+                            esac
+                        done <<< "\$resolved_raw"
+
+                        if [ "\$parse_ok" -eq 1 ]; then
+                            if [ "\${#injected[@]}" -gt 0 ]; then
+                                if new_key_id="\$(printf '%s\n' "\${injected[@]}" | keyctl padd user "\$cache_desc" @u 2>/dev/null)"; then
+                                    keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
+                                fi
+                            fi
+                            exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                        fi
+                        # parse_ok=0: a resolved value contained a literal
+                        # newline, which this line-oriented cache format
+                        # cannot represent safely. Fall through to the
+                        # uncached path below, which never parses op's
+                        # output at all, so it has no such limitation.
+                    else
+                        op_rc=\$?
+                        if [ "\$op_rc" -eq 9 ]; then
+                            op_rate_limit_hint
+                        fi
+                        exit "\$op_rc"
+                    fi
+                fi
+
+                # Uncached path: caching disabled (OP_ENV_WRAPPER_CACHE_TTL=0),
+                # keyctl unavailable, or a cache-path anomaly above. Identical
+                # to the wrapper's pre-cache behavior.
                 # Strip the service-account token AND the internal
                 # WRAPPER_STAGE sentinel from the final child env. Unsetting
                 # WRAPPER_STAGE lets one wrapper invoke another without the
@@ -360,7 +486,7 @@ case "\$(uname -s)" in
                 op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
                     env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
                 if [ "\$rc" -eq 9 ]; then
-                    err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait, or cut op-run frequency. See https://www.1password.dev/service-accounts/rate-limits/"
+                    op_rate_limit_hint
                 fi
                 exit "\$rc"
                 ;;
@@ -405,7 +531,7 @@ case "\$(uname -s)" in
             op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
             env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
         if [ "\$rc" -eq 9 ]; then
-            err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait. See https://www.1password.dev/service-accounts/rate-limits/"
+            op_rate_limit_hint
         fi
         exit "\$rc"
         ;;
