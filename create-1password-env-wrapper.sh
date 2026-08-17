@@ -391,13 +391,30 @@ case "\$(uname -s)" in
                     ''|*[!0-9]*) cache_ttl=0 ;;  # malformed -> disabled, fail open
                 esac
 
+                # Sentinel cached in place of a real variable diff when an
+                # Environment's resolved output contains a literal newline
+                # (e.g. a multi-line PEM key) that this line-oriented cache
+                # format cannot represent safely (see the parse_ok=0 branch
+                # below). It can never collide with a real cached NAME=VALUE
+                # line (no \`=\` in it), and its presence lets every other
+                # call within the same TTL window skip straight to the
+                # single uncached op-run call instead of re-paying for a
+                # wasted introspection resolve on every single invocation —
+                # without it, a non-cacheable Environment would cost TWO op
+                # calls (introspect, then fall back) on every call, slower
+                # than caching having never been added at all.
+                UNCACHEABLE_MARKER='__OP_ENV_WRAPPER_UNCACHEABLE__'
+
                 if [ "\$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1; then
                     cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}"
+                    cached_raw=""
+                    key_id="\$(keyctl search @u user "\$cache_desc" 2>/dev/null)" || key_id=""
+                    if [ -n "\$key_id" ]; then
+                        cached_raw="\$(keyctl pipe "\$key_id" 2>/dev/null)" || cached_raw=""
+                    fi
 
                     # --- cache hit? ---
-                    if key_id="\$(keyctl search @u user "\$cache_desc" 2>/dev/null)" \\
-                            && cached_raw="\$(keyctl pipe "\$key_id" 2>/dev/null)" \\
-                            && [ -n "\$cached_raw" ]; then
+                    if [ -n "\$cached_raw" ] && [ "\$cached_raw" != "\$UNCACHEABLE_MARKER" ]; then
                         assign=()
                         cache_ok=1
                         while IFS= read -r line; do
@@ -413,56 +430,70 @@ case "\$(uname -s)" in
                         # a miss and fall through to resolve fresh below).
                     fi
 
-                    # --- cache miss: resolve via an introspection target
-                    # (\`env\`, not the real command) so we learn exactly which
-                    # variables op injected, cache that diff, then launch the
-                    # real command ourselves. This is the ONLY \`op run\` call
-                    # on a cache miss — the real command never runs under op.
-                    baseline_raw="\$(env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"
-                    if resolved_raw="\$(op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"; then
-                        declare -A base_map=()
-                        while IFS= read -r line; do
-                            case "\$line" in
-                                [A-Za-z_]*=*) base_map["\${line%%=*}"]="\${line#*=}" ;;
-                            esac
-                        done <<< "\$baseline_raw"
+                    # --- cache miss, UNLESS this Environment is already
+                    # known (within this TTL window) to be uncacheable, in
+                    # which case skip straight to the uncached path below
+                    # without wasting an introspection call. ---
+                    if [ "\$cached_raw" != "\$UNCACHEABLE_MARKER" ]; then
+                        # Resolve via an introspection target (\`env\`, not
+                        # the real command) so we learn exactly which
+                        # variables op injected, cache that diff, then
+                        # launch the real command ourselves. This is the
+                        # ONLY \`op run\` call on a cache miss — the real
+                        # command never runs under op.
+                        baseline_raw="\$(env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"
+                        if resolved_raw="\$(op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"; then
+                            declare -A base_map=()
+                            while IFS= read -r line; do
+                                case "\$line" in
+                                    [A-Za-z_]*=*) base_map["\${line%%=*}"]="\${line#*=}" ;;
+                                esac
+                            done <<< "\$baseline_raw"
 
-                        assign=()
-                        injected=()
-                        parse_ok=1
-                        while IFS= read -r line; do
-                            case "\$line" in
-                                [A-Za-z_]*=*)
-                                    assign+=("\$line")
-                                    name="\${line%%=*}"
-                                    value="\${line#*=}"
-                                    if [ "\${base_map[\$name]+set}" != "set" ] || [ "\${base_map[\$name]}" != "\$value" ]; then
-                                        injected+=("\$line")
+                            assign=()
+                            injected=()
+                            parse_ok=1
+                            while IFS= read -r line; do
+                                case "\$line" in
+                                    [A-Za-z_]*=*)
+                                        assign+=("\$line")
+                                        name="\${line%%=*}"
+                                        value="\${line#*=}"
+                                        if [ "\${base_map[\$name]+set}" != "set" ] || [ "\${base_map[\$name]}" != "\$value" ]; then
+                                            injected+=("\$line")
+                                        fi
+                                        ;;
+                                    *) parse_ok=0; break ;;
+                                esac
+                            done <<< "\$resolved_raw"
+
+                            if [ "\$parse_ok" -eq 1 ]; then
+                                if [ "\${#injected[@]}" -gt 0 ]; then
+                                    if new_key_id="\$(printf '%s\n' "\${injected[@]}" | keyctl padd user "\$cache_desc" @u 2>/dev/null)"; then
+                                        keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
                                     fi
-                                    ;;
-                                *) parse_ok=0; break ;;
-                            esac
-                        done <<< "\$resolved_raw"
-
-                        if [ "\$parse_ok" -eq 1 ]; then
-                            if [ "\${#injected[@]}" -gt 0 ]; then
-                                if new_key_id="\$(printf '%s\n' "\${injected[@]}" | keyctl padd user "\$cache_desc" @u 2>/dev/null)"; then
-                                    keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
                                 fi
+                                exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
                             fi
-                            exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                            # parse_ok=0: a resolved value contained a
+                            # literal newline, which this line-oriented
+                            # cache format cannot represent safely. Never
+                            # guess how to reassemble a multi-line value —
+                            # record the UNCACHEABLE_MARKER instead (so
+                            # later calls this TTL window skip the wasted
+                            # introspection attempt) and fall through to the
+                            # uncached path below, which never parses op's
+                            # output at all, so it has no such limitation.
+                            if new_key_id="\$(printf '%s' "\$UNCACHEABLE_MARKER" | keyctl padd user "\$cache_desc" @u 2>/dev/null)"; then
+                                keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
+                            fi
+                        else
+                            op_rc=\$?
+                            if [ "\$op_rc" -eq 9 ]; then
+                                op_rate_limit_hint
+                            fi
+                            exit "\$op_rc"
                         fi
-                        # parse_ok=0: a resolved value contained a literal
-                        # newline, which this line-oriented cache format
-                        # cannot represent safely. Fall through to the
-                        # uncached path below, which never parses op's
-                        # output at all, so it has no such limitation.
-                    else
-                        op_rc=\$?
-                        if [ "\$op_rc" -eq 9 ]; then
-                            op_rate_limit_hint
-                        fi
-                        exit "\$op_rc"
                     fi
                 fi
 

@@ -212,7 +212,9 @@ with `OP_ENV_WRAPPER_CACHE_TTL=<seconds>`, or set `=0` to disable
 caching for that call. Requires the `keyutils` package (`keyctl` on
 `PATH`) — if it is missing, or an Environment contains a multi-line
 value (e.g. a PEM key), the wrapper falls open to the uncached path
-automatically; no action is needed either way. Full design and
+automatically (remembering the latter case for the rest of the TTL
+window, so it costs at most one wasted extra `op` call, not one on
+every invocation); no action is needed either way. Full design and
 failure-mode contract: SPECIFICATION.md § "TTL cache of the
 op-resolved environment".
 

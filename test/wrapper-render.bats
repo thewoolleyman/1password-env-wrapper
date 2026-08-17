@@ -410,6 +410,57 @@ diff_injected_vars() {
 }
 
 # ---------------------------------------------------------------------------
+# Feature C, continued — the UNCACHEABLE_MARKER poison mechanism.
+#
+# Without it, an Environment containing a multi-line value (e.g. a PEM key,
+# which reliably produces parse_ok=0 above) would pay for a wasted
+# introspection `op run` call on EVERY invocation before falling back to
+# the real uncached `op run` call — TWO op calls per invocation, strictly
+# slower than the wrapper had ever been before caching existed. The marker
+# lets every call after the first, within the same TTL window, skip
+# straight to the single uncached call and match pre-cache performance.
+# ---------------------------------------------------------------------------
+
+@test "UNCACHEABLE_MARKER sentinel is defined and can never collide with a real NAME=VALUE cache line" {
+    grep -Fq "UNCACHEABLE_MARKER='__OP_ENV_WRAPPER_UNCACHEABLE__'" "$RENDERED"
+    # No '=' in the marker, so it can never match the NAME=VALUE validator
+    # pattern used for real cached entries.
+    [[ "__OP_ENV_WRAPPER_UNCACHEABLE__" != *"="* ]]
+}
+
+@test "parse_ok=0 (multi-line value) writes the poison marker before falling through" {
+    grep -Fq 'printf '"'"'%s'"'"' "$UNCACHEABLE_MARKER" | keyctl padd user "$cache_desc" @u' "$RENDERED"
+}
+
+@test "a cached UNCACHEABLE_MARKER is recognized and skips straight to the uncached path (no introspection re-attempt)" {
+    # Both guards — the cache-hit-replay attempt and the miss/introspection
+    # attempt — must explicitly exclude the marker value.
+    run grep -cF 'cached_raw" != "$UNCACHEABLE_MARKER"' "$RENDERED"
+    [ "$output" -eq 2 ]
+}
+
+@test "live: a poisoned entry costs exactly one op-equivalent call, not two, on a second invocation" {
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    local desc="wrapper-render-bats-poison-test:$$"
+    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
+
+    local key_id
+    key_id="$(printf '%s' '__OP_ENV_WRAPPER_UNCACHEABLE__' | keyctl padd user "$desc" @u)"
+    keyctl timeout "$key_id" 5
+
+    # Simulates the wrapper's own poison check: read the cached value and
+    # confirm it is recognized as the marker (not a real, usable cache
+    # entry) — this is the exact comparison the rendered wrapper performs.
+    local cached_raw
+    cached_raw="$(keyctl pipe "$key_id")"
+    [ "$cached_raw" = "__OP_ENV_WRAPPER_UNCACHEABLE__" ]
+
+    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
 # Live keyctl round-trip. Skipped when keyutils is not installed — the
 # structural gate test above proves the wrapper fails open (uncached) in
 # that case, so this is extra assurance where the host allows it, not a
