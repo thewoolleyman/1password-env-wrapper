@@ -825,18 +825,35 @@ entirely.
   or overrode. Only that diff is written to the cache; the real
   command is then launched directly by the wrapper itself (never as
   a child of `op`) with the diff applied on top of the current
-  environment. A cache miss therefore costs the same single `op run`
-  call the uncached path costs today — caching never doubles op
-  invocations.
+  environment. A cache miss on a cacheable Environment therefore costs
+  the same single `op run` call the uncached path costs today —
+  caching never doubles op invocations for the common case.
 - If computing the diff fails — in practice, because a resolved
   value contains a literal newline, which this line-oriented cache
   format cannot represent unambiguously (for example, a multi-line
   PEM private key stored as an Environment value) — the wrapper SHALL
-  NOT write to the cache for that invocation and SHALL fall through
-  to the uncached path. An Environment containing only single-line
+  NOT write a variable diff to the cache for that invocation, SHALL
+  instead write a reserved `UNCACHEABLE_MARKER` sentinel (a value
+  containing no `=`, so it can never collide with a real cached
+  `NAME=VALUE` line) under the same TTL, and SHALL fall through to the
+  uncached path for that invocation. On every subsequent invocation
+  within that TTL window, finding `UNCACHEABLE_MARKER` SHALL cause the
+  wrapper to skip the introspection resolve entirely and go straight
+  to the uncached path — so an Environment with a multi-line value
+  pays for the wasted introspection call **at most once per TTL
+  window**, not on every invocation, matching the uncached path's
+  single-`op`-call cost for every call after the first. Without this
+  marker, such an Environment would cost TWO `op run` calls on every
+  single invocation (the wasted introspection attempt plus the real
+  uncached fallback) — strictly slower than the wrapper had ever been
+  before caching existed, which was confirmed against the real
+  `openbrain` identifier during validation (it holds a PEM key) before
+  this mechanism was added. An Environment containing only single-line
   values (the common case: tokens, connection strings, API keys) is
   fully cacheable; an Environment with any multi-line value is always
-  served correctly but never benefits from caching.
+  served correctly but never benefits from caching, and never regresses
+  below its pre-cache baseline cost after the first invocation per TTL
+  window.
 - A cache miss or **any** cache-path anomaly (a missing `keyctl`
   binary, a malformed or unreadable cache entry, a diff/parse
   failure) SHALL fall open to the uncached `op run` path — never to
@@ -1427,6 +1444,25 @@ with-openbrain-env.sh printenv TEST_FOO` twice in immediate succession
 Then both invocations resolve via `op run --environment`
 
 And no kernel keyring entry is created for either invocation
+
+### Scenario: an Environment with a multi-line value never regresses below its pre-cache baseline
+
+Given `openbrain`'s configured Environment contains a variable whose
+value spans multiple lines (e.g. a PEM private key), and
+`OP_ENV_WRAPPER_CACHE_TTL` is unset (default 300s)
+
+When `openbrain` runs `with-openbrain-env.sh printenv TEST_FOO` three
+times in immediate succession
+
+Then the first invocation makes two `op run --environment` calls (the
+introspection resolve attempt, which detects the multi-line value and
+cannot cache it, followed by the uncached fallback) and writes the
+`UNCACHEABLE_MARKER` sentinel to the kernel keyring
+
+And the second and third invocations each make exactly one `op run
+--environment` call — the wasted introspection attempt is skipped
+because the marker is found — matching the cost of the uncached path
+on every call after the first
 
 ### Scenario: Missing 1Password access fails closed
 
