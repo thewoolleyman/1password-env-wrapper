@@ -206,15 +206,17 @@ Every wrapper invocation calls `op run --environment`, which costs
 real CPU time regardless of `op`'s own `OP_CACHE` setting (see
 SPECIFICATION.md). On Linux, the wrapper caches the *resolved
 variables themselves* — outside of op, in the invoking user's kernel
-keyring — so a repeated invocation within the TTL window skips
-calling `op` entirely. Default TTL is 300s; override per-invocation
-with `OP_ENV_WRAPPER_CACHE_TTL=<seconds>`, or set `=0` to disable
-caching for that call. Requires the `keyutils` package (`keyctl` on
-`PATH`) — if it is missing, or an Environment contains a multi-line
-value (e.g. a PEM key), the wrapper falls open to the uncached path
-automatically (remembering the latter case for the rest of the TTL
-window, so it costs at most one wasted extra `op` call, not one on
-every invocation); no action is needed either way. Full design and
+**persistent keyring** (`keyctl get_persistent`, not the plain `@u`
+keyring — `setpriv`'s privilege drop never establishes a login
+session, so a plain `@u` entry would be unreadable by the very next
+invocation) — so a repeated invocation within the TTL window skips
+calling `op` entirely, with zero exceptions: framing is NUL-delimited,
+so even a multi-line value (e.g. a PEM key) caches and replays
+correctly. Default TTL is 300s; override per-invocation with
+`OP_ENV_WRAPPER_CACHE_TTL=<seconds>`, or set `=0` to disable caching
+for that call. Requires the `keyutils` package (`keyctl` on `PATH`)
+— if it is missing, the wrapper falls open to the uncached path
+automatically; no action is needed either way. Full design and
 failure-mode contract: SPECIFICATION.md § "TTL cache of the
 op-resolved environment".
 

@@ -793,71 +793,74 @@ entirely.
   including `=0` — reaches Stage 2 on the normal, non-privileged
   invocation path, not only when the caller already invoked via an
   external `sudo -E`.
-- Storage: the invoking user's kernel keyring (`keyctl`, the `@u`
-  user keyring, scoped by real uid — the uid Stage 2 always runs as
-  after the `setpriv` drop, or root's own uid under
-  `OPENV_KEEP_PRIVILEGES=1`). Kernel keyring entries live only in
-  kernel memory (never touch disk), are readable only by that uid's
-  own processes (and root), and `keyctl timeout` gives the **kernel**
-  itself an expiry, so an expired entry is simply gone rather than
-  stale data the wrapper must remember to distrust. This was chosen
-  over a systemd-creds file specifically because systemd-creds has no
-  built-in TTL and decrypts into root-owned state — the wrong shape
-  for a short-lived, per-invoker cache the invoker's own unprivileged
-  process must cheaply read back itself.
-- `keyctl` (the `keyutils` package) is a **soft** dependency: when it
-  is not on `PATH`, the wrapper SHALL skip the cache entirely and run
-  the uncached path. The wrapper's functional correctness never
-  depends on `keyutils` being installed; the installer does not add
-  it as a prerequisite.
+- **Storage: the invoking user's kernel *persistent* keyring**
+  (`keyctl get_persistent @s`), not the plain `@u` user keyring —
+  scoped by real uid, the uid Stage 2 always runs as after the
+  `setpriv` drop, or root's own uid under `OPENV_KEEP_PRIVILEGES=1`.
+  This distinction is load-bearing, not stylistic: `setpriv` changes
+  uid via a raw syscall with no PAM/login session, so a process that
+  reaches Stage 2 this way never acquires kernel "Possessor" status
+  over the plain `@u` keyring's contents. A key added directly to
+  `@u` gets only the default "same uid, non-possessor" permission
+  class on every *other* process — including a later, wholly separate
+  invocation of the wrapper as the exact same uid — which grants
+  `view` but not `read`, so the read fails closed with `EPERM`
+  (confirmed against a real, non-interactively-logged-in service
+  account during validation: a key written by one invocation was
+  unreadable by the next). `keyctl get_persistent` exists precisely
+  to make a uid-scoped keyring usable across separate process
+  invocations without a login session: it creates-or-fetches a
+  persistent keyring for the calling uid *and* links it into the
+  calling process's own session, so every invocation becomes a
+  genuine possessor of it and reads succeed. The persistent keyring
+  itself has its own kernel-default 3-day idle expiry, which is
+  immaterial here since every individual cached key inside it carries
+  its own much shorter `OP_ENV_WRAPPER_CACHE_TTL`-controlled timeout.
+- Framing is **NUL-delimited** throughout (`env -0` for both the
+  baseline snapshot and the introspection resolve; `keyctl padd` /
+  `keyctl pipe` fed through a real pipe directly into `mapfile -d
+  ''`, never staged through a bash variable, since bash strings
+  cannot hold embedded NUL bytes) rather than newline-delimited. A
+  POSIX environment variable name or value cannot itself contain a
+  NUL byte, so this framing is unambiguous even when a value contains
+  a literal newline (for example, a multi-line PEM private key) —
+  there is no line-continuation heuristic and no possibility of a
+  value's own content being misread as a record boundary. Every
+  Environment is fully cacheable under this framing; there is no
+  class of value this design cannot cache. (`shopt -s lastpipe`
+  keeps the last stage of each pipeline in the current shell rather
+  than a subshell, so `mapfile` can populate arrays used afterward,
+  while `${PIPESTATUS[0]}` still gives the real exit status of the
+  command that produced the piped data — needed because op's
+  introspection-resolve call sits on the left side of a pipeline.)
 - On a cache **hit**, the wrapper SHALL replay only the previously
   cached variables on top of the invoker's *current* ambient
   environment — never a stale snapshot of the whole environment — so
   a hit still honors the "1Password value wins" override rule below
   without clobbering unrelated variables the caller set between
-  invocations.
+  invocations. Before trusting a replayed entry as an `env` operand,
+  the wrapper SHALL verify it contains `=`; a cache entry that
+  somehow lacks it (a corrupted or format-incompatible entry) is
+  treated as a miss rather than being handed to `env`, where a
+  bare non-assignment token would be misread as the start of the
+  command rather than an assignment.
 - On a cache **miss**, Stage 2 SHALL resolve the Environment via
   **exactly one** `op run --no-masking --environment <ID> -- env -u
-  OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE` call whose target is an
-  introspection command (`env`), not the real command, so the
+  OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0` call whose target is
+  an introspection command (`env -0`), not the real command, so the
   wrapper can diff the result against a pre-op baseline snapshot of
   its own environment and learn exactly which variables op injected
   or overrode. Only that diff is written to the cache; the real
   command is then launched directly by the wrapper itself (never as
-  a child of `op`) with the diff applied on top of the current
-  environment. A cache miss on a cacheable Environment therefore costs
-  the same single `op run` call the uncached path costs today —
-  caching never doubles op invocations for the common case.
-- If computing the diff fails — in practice, because a resolved
-  value contains a literal newline, which this line-oriented cache
-  format cannot represent unambiguously (for example, a multi-line
-  PEM private key stored as an Environment value) — the wrapper SHALL
-  NOT write a variable diff to the cache for that invocation, SHALL
-  instead write a reserved `UNCACHEABLE_MARKER` sentinel (a value
-  containing no `=`, so it can never collide with a real cached
-  `NAME=VALUE` line) under the same TTL, and SHALL fall through to the
-  uncached path for that invocation. On every subsequent invocation
-  within that TTL window, finding `UNCACHEABLE_MARKER` SHALL cause the
-  wrapper to skip the introspection resolve entirely and go straight
-  to the uncached path — so an Environment with a multi-line value
-  pays for the wasted introspection call **at most once per TTL
-  window**, not on every invocation, matching the uncached path's
-  single-`op`-call cost for every call after the first. Without this
-  marker, such an Environment would cost TWO `op run` calls on every
-  single invocation (the wasted introspection attempt plus the real
-  uncached fallback) — strictly slower than the wrapper had ever been
-  before caching existed, which was confirmed against the real
-  `openbrain` identifier during validation (it holds a PEM key) before
-  this mechanism was added. An Environment containing only single-line
-  values (the common case: tokens, connection strings, API keys) is
-  fully cacheable; an Environment with any multi-line value is always
-  served correctly but never benefits from caching, and never regresses
-  below its pre-cache baseline cost after the first invocation per TTL
-  window.
+  a child of `op`) with the full resolved set applied on top of the
+  current environment. A cache miss therefore costs the same single
+  `op run` call the uncached path costs today, for every Environment
+  — caching never doubles op invocations, regardless of whether any
+  value contains a literal newline.
 - A cache miss or **any** cache-path anomaly (a missing `keyctl`
-  binary, a malformed or unreadable cache entry, a diff/parse
-  failure) SHALL fall open to the uncached `op run` path — never to
-  a broken or incorrect result.
+  binary, `keyctl get_persistent` failing, a malformed or unreadable
+  cache entry) SHALL fall open to the uncached `op run` path — never
+  to a broken or incorrect result.
 - Both the cached-replay exec and the freshly-resolved-on-miss exec
   SHALL strip `OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` from the
   child exactly as the uncached path does, per the Environment
@@ -1445,24 +1448,27 @@ Then both invocations resolve via `op run --environment`
 
 And no kernel keyring entry is created for either invocation
 
-### Scenario: an Environment with a multi-line value never regresses below its pre-cache baseline
+### Scenario: an Environment with a multi-line value is fully cacheable, same as any other
 
 Given `openbrain`'s configured Environment contains a variable whose
 value spans multiple lines (e.g. a PEM private key), and
 `OP_ENV_WRAPPER_CACHE_TTL` is unset (default 300s)
 
-When `openbrain` runs `with-openbrain-env.sh printenv TEST_FOO` three
+When `openbrain` runs `with-openbrain-env.sh printenv PEM_KEY` three
 times in immediate succession
 
-Then the first invocation makes two `op run --environment` calls (the
-introspection resolve attempt, which detects the multi-line value and
-cannot cache it, followed by the uncached fallback) and writes the
-`UNCACHEABLE_MARKER` sentinel to the kernel keyring
+Then the first invocation makes exactly one `op run --environment`
+call (the introspection resolve, whose NUL-delimited framing
+represents the multi-line value unambiguously) and caches the diff,
+including that variable, in the invoking user's persistent keyring
 
-And the second and third invocations each make exactly one `op run
---environment` call — the wasted introspection attempt is skipped
-because the marker is found — matching the cost of the uncached path
-on every call after the first
+And the second and third invocations make **no** `op run
+--environment` call at all — the NUL-delimited cache replays the
+multi-line value byte-for-byte, identical to a cache hit for any
+single-line value
+
+And `printenv PEM_KEY` prints the identical multi-line value on all
+three invocations
 
 ### Scenario: Missing 1Password access fails closed
 

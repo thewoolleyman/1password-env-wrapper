@@ -368,14 +368,34 @@ case "\$(uname -s)" in
                 # Opt out per-call with OP_ENV_WRAPPER_CACHE_TTL=0; default TTL
                 # is 300s, overridable with the same variable.
                 #
-                # Storage: the invoking user's kernel keyring (\`@u\`, scoped by
-                # real uid — the same uid stage 2 always runs as after the
-                # setpriv drop, or root's own uid under OPENV_KEEP_PRIVILEGES=1).
-                # Chosen over a systemd-creds file because keyring entries live
-                # only in kernel memory (never touch disk), are readable only by
-                # that uid's own processes (and root), and \`keyctl timeout\`
-                # gives the KERNEL an expiry, so an expired entry is simply gone
-                # rather than stale data this script has to remember to distrust.
+                # Storage: the invoking user's kernel PERSISTENT keyring
+                # (\`keyctl get_persistent\`), scoped by real uid — the same
+                # uid stage 2 always runs as after the setpriv drop, or
+                # root's own uid under OPENV_KEEP_PRIVILEGES=1. This is
+                # deliberately NOT the plain \`@u\` user keyring: \`setpriv\`
+                # changes uid via a raw syscall, with no PAM/login session,
+                # so the resulting process never gets kernel "Possessor"
+                # status over \`@u\`'s contents — even the process that just
+                # created a key there gets only the restrictive default
+                # "same uid, non-possessor" permission class back (view
+                # only, no read), so a later, separate invocation (even the
+                # very same uid) fails to read it with EPERM. The
+                # persistent-keyring facility exists precisely for "a
+                # uid-scoped keyring usable across separate process
+                # invocations without a login session": \`get_persistent\`
+                # both creates-or-fetches it AND links it into the calling
+                # process's session, so every invocation is a genuine
+                # possessor of it, and reads work correctly. Also chosen
+                # over a systemd-creds file because keyring entries live
+                # only in kernel memory (never touch disk), are readable
+                # only by that uid's own processes (and root), and
+                # \`keyctl timeout\` on the individual cached key gives the
+                # KERNEL an expiry, so an expired entry is simply gone
+                # rather than stale data this script has to remember to
+                # distrust. (The persistent keyring itself also has its own
+                # much longer idle-expiry, kernel-default 3 days, which is
+                # irrelevant here since every cached key inside it carries
+                # its own shorter TTL.)
                 #
                 # Only the variables op run actually injects are cached — never
                 # the wrapper's whole ambient environment — so a cache hit can
@@ -385,116 +405,90 @@ case "\$(uname -s)" in
                 # (per the "1Password value wins" override rule below). Any
                 # cache miss or cache-path anomaly falls through unchanged to
                 # the uncached op-run path.
+                #
+                # Framing is NUL-delimited (\`env -0\`; \`keyctl padd\`/\`pipe\`
+                # fed through a real pipe into \`mapfile\`, never through a
+                # bash variable) rather than newline-delimited: a POSIX
+                # environment variable name or value cannot contain a NUL
+                # byte, so this framing is unambiguous even when a value
+                # itself contains a literal newline (e.g. a multi-line PEM
+                # private key) — no line-continuation guessing, no risk of
+                # misreading a value's own content as a record boundary.
+                # \`shopt -s lastpipe\` makes the last stage of each pipeline
+                # below run in this shell rather than a subshell, so
+                # \`mapfile\` can populate arrays used afterward, while
+                # \`\${PIPESTATUS[0]}\` still gives the real exit status of the
+                # command that produced the piped data.
                 # ---------------------------------------------------------------
+                shopt -s lastpipe
                 cache_ttl="\${OP_ENV_WRAPPER_CACHE_TTL:-300}"
                 case "\$cache_ttl" in
                     ''|*[!0-9]*) cache_ttl=0 ;;  # malformed -> disabled, fail open
                 esac
 
-                # Sentinel cached in place of a real variable diff when an
-                # Environment's resolved output contains a literal newline
-                # (e.g. a multi-line PEM key) that this line-oriented cache
-                # format cannot represent safely (see the parse_ok=0 branch
-                # below). It can never collide with a real cached NAME=VALUE
-                # line (no \`=\` in it), and its presence lets every other
-                # call within the same TTL window skip straight to the
-                # single uncached op-run call instead of re-paying for a
-                # wasted introspection resolve on every single invocation —
-                # without it, a non-cacheable Environment would cost TWO op
-                # calls (introspect, then fall back) on every call, slower
-                # than caching having never been added at all.
-                UNCACHEABLE_MARKER='__OP_ENV_WRAPPER_UNCACHEABLE__'
-
-                if [ "\$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1; then
+                if [ "\$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1 \\
+                        && persistent_kr="\$(keyctl get_persistent @s 2>/dev/null)"; then
                     cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}"
-                    cached_raw=""
-                    key_id="\$(keyctl search @u user "\$cache_desc" 2>/dev/null)" || key_id=""
-                    if [ -n "\$key_id" ]; then
-                        cached_raw="\$(keyctl pipe "\$key_id" 2>/dev/null)" || cached_raw=""
-                    fi
 
                     # --- cache hit? ---
-                    if [ -n "\$cached_raw" ] && [ "\$cached_raw" != "\$UNCACHEABLE_MARKER" ]; then
-                        assign=()
-                        cache_ok=1
-                        while IFS= read -r line; do
-                            case "\$line" in
-                                [A-Za-z_]*=*) assign+=("\$line") ;;
-                                *) cache_ok=0; break ;;
+                    assign=()
+                    if key_id="\$(keyctl search "\$persistent_kr" user "\$cache_desc" 2>/dev/null)"; then
+                        keyctl pipe "\$key_id" 2>/dev/null | mapfile -d '' -t assign
+                        # Sanity-check every replayed entry looks like
+                        # NAME=VALUE before trusting it as an \`env\` operand —
+                        # a value missing '=' entirely would otherwise be
+                        # interpreted by \`env\` as the START OF THE COMMAND
+                        # rather than an assignment. This guards only against
+                        # a corrupted/incompatible cache entry, never against
+                        # legitimate multi-line values (NUL framing already
+                        # makes those unambiguous).
+                        for kv in "\${assign[@]}"; do
+                            case "\$kv" in
+                                *=*) ;;
+                                *) assign=(); break ;;
                             esac
-                        done <<< "\$cached_raw"
-                        if [ "\$cache_ok" -eq 1 ] && [ "\${#assign[@]}" -gt 0 ]; then
-                            exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
-                        fi
-                        # Malformed cache entry (should not happen — treat as
-                        # a miss and fall through to resolve fresh below).
+                        done
+                    fi
+                    if [ "\${#assign[@]}" -gt 0 ]; then
+                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
                     fi
 
-                    # --- cache miss, UNLESS this Environment is already
-                    # known (within this TTL window) to be uncacheable, in
-                    # which case skip straight to the uncached path below
-                    # without wasting an introspection call. ---
-                    if [ "\$cached_raw" != "\$UNCACHEABLE_MARKER" ]; then
-                        # Resolve via an introspection target (\`env\`, not
-                        # the real command) so we learn exactly which
-                        # variables op injected, cache that diff, then
-                        # launch the real command ourselves. This is the
-                        # ONLY \`op run\` call on a cache miss — the real
-                        # command never runs under op.
-                        baseline_raw="\$(env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"
-                        if resolved_raw="\$(op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE)"; then
-                            declare -A base_map=()
-                            while IFS= read -r line; do
-                                case "\$line" in
-                                    [A-Za-z_]*=*) base_map["\${line%%=*}"]="\${line#*=}" ;;
-                                esac
-                            done <<< "\$baseline_raw"
+                    # --- cache miss: resolve via an introspection target
+                    # (\`env -0\`, not the real command) so we learn exactly
+                    # which variables op injected, cache that diff, then
+                    # launch the real command ourselves. This is the ONLY
+                    # \`op run\` call on a cache miss — the real command never
+                    # runs under op.
+                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t baseline_arr
+                    declare -A base_map=()
+                    for kv in "\${baseline_arr[@]}"; do
+                        base_map["\${kv%%=*}"]="\${kv#*=}"
+                    done
 
-                            assign=()
-                            injected=()
-                            parse_ok=1
-                            while IFS= read -r line; do
-                                case "\$line" in
-                                    [A-Za-z_]*=*)
-                                        assign+=("\$line")
-                                        name="\${line%%=*}"
-                                        value="\${line#*=}"
-                                        if [ "\${base_map[\$name]+set}" != "set" ] || [ "\${base_map[\$name]}" != "\$value" ]; then
-                                            injected+=("\$line")
-                                        fi
-                                        ;;
-                                    *) parse_ok=0; break ;;
-                                esac
-                            done <<< "\$resolved_raw"
-
-                            if [ "\$parse_ok" -eq 1 ]; then
-                                if [ "\${#injected[@]}" -gt 0 ]; then
-                                    if new_key_id="\$(printf '%s\n' "\${injected[@]}" | keyctl padd user "\$cache_desc" @u 2>/dev/null)"; then
-                                        keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
-                                    fi
-                                fi
-                                exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                    op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t resolved_arr
+                    op_rc="\${PIPESTATUS[0]}"
+                    if [ "\$op_rc" -eq 0 ]; then
+                        assign=()
+                        injected=()
+                        for kv in "\${resolved_arr[@]}"; do
+                            assign+=("\$kv")
+                            name="\${kv%%=*}"
+                            value="\${kv#*=}"
+                            if [ "\${base_map[\$name]+set}" != "set" ] || [ "\${base_map[\$name]}" != "\$value" ]; then
+                                injected+=("\$kv")
                             fi
-                            # parse_ok=0: a resolved value contained a
-                            # literal newline, which this line-oriented
-                            # cache format cannot represent safely. Never
-                            # guess how to reassemble a multi-line value —
-                            # record the UNCACHEABLE_MARKER instead (so
-                            # later calls this TTL window skip the wasted
-                            # introspection attempt) and fall through to the
-                            # uncached path below, which never parses op's
-                            # output at all, so it has no such limitation.
-                            if new_key_id="\$(printf '%s' "\$UNCACHEABLE_MARKER" | keyctl padd user "\$cache_desc" @u 2>/dev/null)"; then
+                        done
+                        if [ "\${#injected[@]}" -gt 0 ]; then
+                            if new_key_id="\$(printf '%s\0' "\${injected[@]}" | keyctl padd user "\$cache_desc" "\$persistent_kr" 2>/dev/null)"; then
                                 keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
                             fi
-                        else
-                            op_rc=\$?
-                            if [ "\$op_rc" -eq 9 ]; then
-                                op_rate_limit_hint
-                            fi
-                            exit "\$op_rc"
                         fi
+                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
                     fi
+                    if [ "\$op_rc" -eq 9 ]; then
+                        op_rate_limit_hint
+                    fi
+                    exit "\$op_rc"
                 fi
 
                 # Uncached path: caching disabled (OP_ENV_WRAPPER_CACHE_TTL=0),

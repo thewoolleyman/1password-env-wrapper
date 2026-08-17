@@ -314,22 +314,59 @@ default_drop_branch() {
 # Feature C — TTL cache of the op-resolved environment
 # (OP_ENV_WRAPPER_CACHE_TTL). See SPECIFICATION.md § "TTL cache of the
 # op-resolved environment" for the full design.
+#
+# Framing is NUL-delimited throughout (env -0; keyctl padd/pipe fed through
+# a real pipe into `mapfile`, never through a bash variable), not
+# newline-delimited: a POSIX environment variable name or value cannot
+# contain a NUL byte, so a value containing a literal newline (e.g. a
+# multi-line PEM private key) is cached and replayed correctly with zero
+# ambiguity, unlike a newline-delimited format.
 # ---------------------------------------------------------------------------
 
-@test "cache is gated on OP_ENV_WRAPPER_CACHE_TTL (default 300s) and keyctl availability" {
+@test "cache is gated on OP_ENV_WRAPPER_CACHE_TTL (default 300s), keyctl, and get_persistent availability" {
     grep -Fq 'cache_ttl="${OP_ENV_WRAPPER_CACHE_TTL:-300}"' "$RENDERED"
-    grep -Fq 'if [ "$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1; then' "$RENDERED"
+    grep -Fq 'if [ "$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1 \' "$RENDERED"
+    grep -Fq '&& persistent_kr="$(keyctl get_persistent @s 2>/dev/null)"; then' "$RENDERED"
 }
 
 @test "a malformed OP_ENV_WRAPPER_CACHE_TTL is normalized to 0 (disabled), not a crash" {
     grep -Fq "''|*[!0-9]*) cache_ttl=0 ;;" "$RENDERED"
 }
 
-@test "cache key is scoped to the user keyring (@u) by IDENTIFIER + Environment ID" {
+@test "lastpipe is enabled so mapfile can populate arrays used after the pipeline" {
+    grep -Fq 'shopt -s lastpipe' "$RENDERED"
+}
+
+@test "cache key is scoped to the user's persistent keyring by IDENTIFIER + Environment ID" {
+    # Deliberately NOT the plain @u user keyring: setpriv's raw uid change
+    # never grants kernel "Possessor" status over @u (no PAM/login session
+    # links it in), so a key added there is unreadable — even by the
+    # process that just created it — from any other process, including a
+    # later, separate invocation as the exact same uid. get_persistent
+    # both creates-or-fetches a uid-scoped keyring AND links it into the
+    # calling process's session, so reads actually work across invocations.
     grep -Fq 'cache_desc="op-env-wrapper-cache:${IDENTIFIER}:${ONEPASSWORD_ENVIRONMENT_ID}"' "$RENDERED"
-    grep -Fq 'keyctl search @u user "$cache_desc"' "$RENDERED"
-    grep -Fq 'keyctl padd user "$cache_desc" @u' "$RENDERED"
+    grep -Fq 'persistent_kr="$(keyctl get_persistent @s 2>/dev/null)"' "$RENDERED"
+    grep -Fq 'keyctl search "$persistent_kr" user "$cache_desc"' "$RENDERED"
+    grep -Fq 'keyctl padd user "$cache_desc" "$persistent_kr"' "$RENDERED"
     grep -Fq 'keyctl timeout "$new_key_id" "$cache_ttl"' "$RENDERED"
+    ! grep -Eq 'keyctl (search|padd)[^"]*"[^"]*"[^"]* @u\b' "$RENDERED"
+}
+
+@test "cache read and write both use NUL delimiting through a real pipe, not a bash variable" {
+    grep -Fq "keyctl pipe \"\$key_id\" 2>/dev/null | mapfile -d '' -t assign" "$RENDERED"
+    grep -Fq "keyctl padd user \"\$cache_desc\" \"\$persistent_kr\"" "$RENDERED"
+    grep -Fq "printf '%s" "$RENDERED"
+    grep -Fq "env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t baseline_arr" "$RENDERED"
+}
+
+@test "a cache-hit replay entry is sanity-checked for '=' before being trusted as an env operand" {
+    # A cache entry missing '=' entirely would otherwise be read by `env`
+    # as the START OF THE COMMAND rather than an assignment — this guards
+    # only against a corrupted/incompatible cache entry, not against
+    # legitimate multi-line values (NUL framing already makes those safe).
+    grep -Fq 'case "$kv" in' "$RENDERED"
+    grep -Fq '*=*) ;;' "$RENDERED"
 }
 
 @test "both cache-path child execs strip OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE" {
@@ -340,155 +377,163 @@ default_drop_branch() {
     [ "$output" -eq 2 ]
 }
 
-@test "a cache miss resolves via an introspection target (env), never the real command, under op" {
-    grep -Fq 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE' "$RENDERED"
+@test "a cache miss resolves via an introspection target (env -0), never the real command, under op" {
+    grep -Fq 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED"
+}
+
+@test "op's exit status on the cache-populate resolve is read via PIPESTATUS, not a bare \$?" {
+    # The resolve call is the left side of a pipeline into mapfile, so a
+    # bare $? after it would report mapfile's status, not op's.
+    grep -Fq 'op_rc="${PIPESTATUS[0]}"' "$RENDERED"
 }
 
 @test "a rate limit (op exit 9) on the cache-populate resolve exits before the child ever runs" {
-    grep -Fq 'op_rc=$?' "$RENDERED"
     grep -Fq '[ "$op_rc" -eq 9 ]' "$RENDERED"
     grep -Fq 'exit "$op_rc"' "$RENDERED"
 }
 
-# The exact NAME=VALUE line-parsing + baseline-diff logic from the wrapper
-# template's stage-2 cache-miss path (first-'='-split, malformed-line
-# detection, "only what changed vs. baseline" diff), lifted verbatim so the
-# test exercises the real algorithm. Keep this in sync with the
-# `base_map` / `assign` / `injected` / `parse_ok` block in
-# create-1password-env-wrapper.sh.
+# The exact baseline-diff logic from the wrapper template's stage-2
+# cache-miss path (first-'='-split, "only what changed vs. baseline"
+# diff), lifted verbatim so the test exercises the real algorithm against
+# already-split arrays (mirroring what `mapfile -d ''` would have produced
+# from NUL-delimited op/env output). Keep this in sync with the
+# `base_map` / `assign` / `injected` loop in create-1password-env-wrapper.sh.
 diff_injected_vars() {
-    local baseline_raw="$1" resolved_raw="$2"
+    local -n _baseline_arr="$1"
+    local -n _resolved_arr="$2"
     local -A base_map=()
-    while IFS= read -r line; do
-        case "$line" in
-            [A-Za-z_]*=*) base_map["${line%%=*}"]="${line#*=}" ;;
-        esac
-    done <<< "$baseline_raw"
+    local kv
+    for kv in "${_baseline_arr[@]}"; do
+        base_map["${kv%%=*}"]="${kv#*=}"
+    done
 
     assign=()
     injected=()
-    parse_ok=1
-    while IFS= read -r line; do
-        case "$line" in
-            [A-Za-z_]*=*)
-                assign+=("$line")
-                local name="${line%%=*}"
-                local value="${line#*=}"
-                if [ "${base_map[$name]+set}" != "set" ] || [ "${base_map[$name]}" != "$value" ]; then
-                    injected+=("$line")
-                fi
-                ;;
-            *) parse_ok=0; break ;;
-        esac
-    done <<< "$resolved_raw"
+    for kv in "${_resolved_arr[@]}"; do
+        assign+=("$kv")
+        local name="${kv%%=*}"
+        local value="${kv#*=}"
+        if [ "${base_map[$name]+set}" != "set" ] || [ "${base_map[$name]}" != "$value" ]; then
+            injected+=("$kv")
+        fi
+    done
 }
 
 @test "diff: a var absent from baseline is injected" {
-    diff_injected_vars $'PATH=/bin' $'PATH=/bin\nTEST_FOO=hello'
-    [ "$parse_ok" -eq 1 ]
+    local baseline=('PATH=/bin')
+    local resolved=('PATH=/bin' 'TEST_FOO=hello')
+    diff_injected_vars baseline resolved
     [ "${#injected[@]}" -eq 1 ]
     [ "${injected[0]}" = "TEST_FOO=hello" ]
     [ "${#assign[@]}" -eq 2 ]
 }
 
 @test "diff: a var unchanged from baseline is NOT re-cached (only the delta is)" {
-    diff_injected_vars $'PATH=/bin\nSAME=1' $'PATH=/bin\nSAME=1'
-    [ "$parse_ok" -eq 1 ]
+    local baseline=('PATH=/bin' 'SAME=1')
+    local resolved=('PATH=/bin' 'SAME=1')
+    diff_injected_vars baseline resolved
     [ "${#injected[@]}" -eq 0 ]
 }
 
 @test "diff: a var overridden by 1Password IS injected with the new (winning) value" {
-    diff_injected_vars $'AMBIENT=original' $'AMBIENT=overridden'
-    [ "$parse_ok" -eq 1 ]
+    local baseline=('AMBIENT=original')
+    local resolved=('AMBIENT=overridden')
+    diff_injected_vars baseline resolved
     [ "${#injected[@]}" -eq 1 ]
     [ "${injected[0]}" = "AMBIENT=overridden" ]
 }
 
-@test "diff: a resolved line that is not NAME=VALUE sets parse_ok=0 (fail open to uncached path)" {
-    diff_injected_vars $'PATH=/bin' $'PATH=/bin\nnot a valid assignment line'
-    [ "$parse_ok" -eq 0 ]
+@test "diff: a value containing a literal newline (e.g. a PEM key) is diffed and cached correctly" {
+    # This is exactly the case the newline-delimited design could not
+    # handle safely; NUL-delimited framing means it is just another array
+    # element here, no special-casing needed.
+    local pem=$'-----BEGIN KEY-----\nMIIEpQIBAAKC\nsomeline==\n-----END KEY-----'
+    local baseline=('PATH=/bin')
+    local resolved=('PATH=/bin' "PEM_KEY=$pem")
+    diff_injected_vars baseline resolved
+    [ "${#injected[@]}" -eq 1 ]
+    [ "${injected[0]}" = "PEM_KEY=$pem" ]
 }
 
 # ---------------------------------------------------------------------------
-# Feature C, continued — the UNCACHEABLE_MARKER poison mechanism.
-#
-# Without it, an Environment containing a multi-line value (e.g. a PEM key,
-# which reliably produces parse_ok=0 above) would pay for a wasted
-# introspection `op run` call on EVERY invocation before falling back to
-# the real uncached `op run` call — TWO op calls per invocation, strictly
-# slower than the wrapper had ever been before caching existed. The marker
-# lets every call after the first, within the same TTL window, skip
-# straight to the single uncached call and match pre-cache performance.
+# Live keyctl round-trip, including a genuine multi-line value. Skipped
+# when keyutils is not installed — the structural gate test above proves
+# the wrapper fails open (uncached) in that case, so this is extra
+# assurance where the host allows it, not a hard requirement of the
+# feature.
 # ---------------------------------------------------------------------------
 
-@test "UNCACHEABLE_MARKER sentinel is defined and can never collide with a real NAME=VALUE cache line" {
-    grep -Fq "UNCACHEABLE_MARKER='__OP_ENV_WRAPPER_UNCACHEABLE__'" "$RENDERED"
-    # No '=' in the marker, so it can never match the NAME=VALUE validator
-    # pattern used for real cached entries.
-    [[ "__OP_ENV_WRAPPER_UNCACHEABLE__" != *"="* ]]
-}
-
-@test "parse_ok=0 (multi-line value) writes the poison marker before falling through" {
-    grep -Fq 'printf '"'"'%s'"'"' "$UNCACHEABLE_MARKER" | keyctl padd user "$cache_desc" @u' "$RENDERED"
-}
-
-@test "a cached UNCACHEABLE_MARKER is recognized and skips straight to the uncached path (no introspection re-attempt)" {
-    # Both guards — the cache-hit-replay attempt and the miss/introspection
-    # attempt — must explicitly exclude the marker value.
-    run grep -cF 'cached_raw" != "$UNCACHEABLE_MARKER"' "$RENDERED"
-    [ "$output" -eq 2 ]
-}
-
-@test "live: a poisoned entry costs exactly one op-equivalent call, not two, on a second invocation" {
+@test "live: keyctl round-trip stores, replays, and expires a cached diff containing a multi-line value" {
     if ! command -v keyctl >/dev/null 2>&1; then
         skip "keyctl (keyutils) not installed on this host"
     fi
-    local desc="wrapper-render-bats-poison-test:$$"
-    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
-
-    local key_id
-    key_id="$(printf '%s' '__OP_ENV_WRAPPER_UNCACHEABLE__' | keyctl padd user "$desc" @u)"
-    keyctl timeout "$key_id" 5
-
-    # Simulates the wrapper's own poison check: read the cached value and
-    # confirm it is recognized as the marker (not a real, usable cache
-    # entry) — this is the exact comparison the rendered wrapper performs.
-    local cached_raw
-    cached_raw="$(keyctl pipe "$key_id")"
-    [ "$cached_raw" = "__OP_ENV_WRAPPER_UNCACHEABLE__" ]
-
-    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
-}
-
-# ---------------------------------------------------------------------------
-# Live keyctl round-trip. Skipped when keyutils is not installed — the
-# structural gate test above proves the wrapper fails open (uncached) in
-# that case, so this is extra assurance where the host allows it, not a
-# hard requirement of the feature.
-# ---------------------------------------------------------------------------
-
-@test "live: keyctl round-trip stores, replays, and expires the cached diff" {
-    if ! command -v keyctl >/dev/null 2>&1; then
-        skip "keyctl (keyutils) not installed on this host"
-    fi
+    # Needed so mapfile, on the right of the pipe below, populates `replay`
+    # in this shell rather than a subshell — same reason the rendered
+    # wrapper itself enables it before using this pattern.
+    shopt -s lastpipe
     local desc="wrapper-render-bats-test:$$"
+    local persistent_kr
+    persistent_kr="$(keyctl get_persistent @s)"
     keyctl purge -p user "$desc" >/dev/null 2>&1 || true
 
+    local pem=$'-----BEGIN KEY-----\nMIIEpQIBAAKC\nsomeline==\n-----END KEY-----'
     local key_id
-    key_id="$(printf '%s\n' 'TEST_FOO=hello' 'TEST_BAR=world' | keyctl padd user "$desc" @u)"
+    key_id="$(printf '%s\0' 'TEST_FOO=hello' "PEM_KEY=$pem" | keyctl padd user "$desc" "$persistent_kr")"
     keyctl timeout "$key_id" 2
 
     local found_id
-    found_id="$(keyctl search @u user "$desc")"
+    found_id="$(keyctl search "$persistent_kr" user "$desc")"
     [ "$found_id" = "$key_id" ]
-    run keyctl pipe "$found_id"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"TEST_FOO=hello"* ]]
-    [[ "$output" == *"TEST_BAR=world"* ]]
+
+    local replay=()
+    keyctl pipe "$found_id" | mapfile -d '' -t replay
+    [ "${#replay[@]}" -eq 2 ]
+    [ "${replay[0]}" = "TEST_FOO=hello" ]
+    [ "${replay[1]}" = "PEM_KEY=$pem" ]
 
     sleep 3
-    run keyctl search @u user "$desc"
+    run keyctl search "$persistent_kr" user "$desc"
     [ "$status" -ne 0 ]
+}
+
+@test "live: a plain @u keyring key is unreadable across a setpriv-only uid transition (the exact bug this design avoids)" {
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    if ! command -v setpriv >/dev/null 2>&1; then
+        skip "setpriv (util-linux) not installed on this host"
+    fi
+    if ! sudo -n true 2>/dev/null; then
+        skip "passwordless sudo not available for this regression check"
+    fi
+    if ! id nobody >/dev/null 2>&1; then
+        skip "no 'nobody' account available for this regression check"
+    fi
+    # Deliberately targets 'nobody' rather than the test runner's own uid:
+    # the test runner's login session already possesses @u via PAM at SSH
+    # login time, which would mask the bug. 'nobody' has no login session,
+    # matching a real non-interactive IDENTIFIER account like this repo's
+    # own 'openbrain' or 'livespec' — the exact case this regression was
+    # found against.
+    local desc="wrapper-render-bats-atu-regression:$$"
+    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
+
+    # Process A: root -> setpriv to nobody — exactly the wrapper's own
+    # Stage 1 -> Stage 2 transition — creates a key directly in the plain
+    # @u user keyring.
+    sudo setpriv --reuid=65534 --regid=65534 --init-groups -- bash -c \
+        'printf "%s\0" "FOO=bar" | keyctl padd user "'"$desc"'" @u >/dev/null'
+
+    # Process B: a SEPARATE setpriv transition to the SAME uid tries to
+    # read it. Without a login/PAM session, this process never becomes a
+    # kernel "Possessor" of @u's contents, so the read fails with EPERM —
+    # this is the actual regression that motivated switching to
+    # get_persistent in the rendered wrapper (see the test above).
+    run sudo setpriv --reuid=65534 --regid=65534 --init-groups -- bash -c \
+        'kid=$(keyctl search @u user "'"$desc"'" 2>/dev/null); keyctl pipe "$kid"'
+    [ "$status" -ne 0 ]
+
+    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
 }
 
 # Tiny local assertion helper so this file does not depend on
