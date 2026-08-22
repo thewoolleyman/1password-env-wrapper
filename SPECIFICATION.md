@@ -888,7 +888,15 @@ entirely.
   meant to survive a boundary the guarding code does not control
   (e.g. an external command re-exec'ing itself through a *different*
   program that is free to rebuild its child's environment wholesale),
-  which environment variables cannot reliably survive.
+  which environment variables cannot reliably survive. A successful
+  recovery is SILENT by default: on a host where `@s` is revoked by
+  construction (the PAM configuration above), recovery is the
+  *normal* path, not an anomaly, and would otherwise fire on
+  essentially every invocation — training callers to filter it out,
+  and corrupting any caller that merges stdout+stderr expecting only
+  the wrapped command's own output. Set `OP_ENV_WRAPPER_DEBUG=1` to
+  see it. This is distinct from the genuine-bypass messages below,
+  which stay unconditional.
 - A cache miss or **any** cache-path anomaly that recovery does not
   resolve (a missing `keyctl` binary, `keyctl get_persistent` still
   failing after the one re-exec attempt, a malformed or unreadable

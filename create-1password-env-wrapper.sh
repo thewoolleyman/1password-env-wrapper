@@ -486,7 +486,22 @@ case "\$(uname -s)" in
                         # self-administered, so it bounds the retry to
                         # exactly one attempt by construction.
                         if keyctl session - true >/dev/null 2>&1; then
-                            err "TTL cache: session keyring (@s) was unusable (commonly: revoked by a dead login session) — re-execing once under a fresh session keyring"
+                            # Quiet by default: on a host where @s is
+                            # revoked by construction (a detached tmux
+                            # server, sudo with no pam_keyinit — see above),
+                            # this is the NORMAL path, not an anomaly, and
+                            # will fire on essentially every invocation. A
+                            # message that fires every time trains callers
+                            # to filter it out, and it corrupts any caller
+                            # that merges stdout+stderr expecting only the
+                            # wrapped command's own output (this repo's own
+                            # integration suite hit exactly that). The
+                            # recovery itself is silent; only a genuine
+                            # bypass (below, and the three other cache-path
+                            # anomalies) stays loud unconditionally.
+                            if [ "\${OP_ENV_WRAPPER_DEBUG:-0}" = 1 ]; then
+                                err "TTL cache: session keyring (@s) was unusable (commonly: revoked by a dead login session) — re-execing once under a fresh session keyring"
+                            fi
                             exec env OPENV_KEYRING_REEXEC=1 keyctl session - "\$INSTALLED_WRAPPER" "\$@"
                         else
                             err "TTL cache bypassed: session keyring (@s) is unusable and a fresh one could not be created (kernel.keys.maxkeys quota exceeded, or keyctl is non-functional here) — falling back to the uncached path"

@@ -362,15 +362,40 @@ default_drop_branch() {
     grep -Fq 'if keyctl session - true >/dev/null 2>&1; then' "$RENDERED"
 }
 
-@test "every cache-bypass reason is reported loudly on stderr, naming which one" {
+@test "every genuine cache-bypass reason is reported loudly and unconditionally on stderr" {
     # Silence is what let this run at the uncached 8.5s baseline, unnoticed,
     # for the caching feature's entire life. TTL=0 is excluded: that's a
-    # deliberate opt-out, not a bypass.
+    # deliberate opt-out, not a bypass. These four ARE genuine bypasses —
+    # the cache really was skipped and the caller really pays full op-run
+    # cost — so none of them may be gated behind OP_ENV_WRAPPER_DEBUG.
+    for msg in \
+        'session keyring (@s) is unusable and a fresh one could not be created' \
+        'still unusable after one re-exec attempt' \
+        'keyctl not found on PATH' \
+        'failed to store the resolved Environment'
+    do
+        line="$(grep -F "$msg" "$RENDERED")"
+        [ -n "$line" ]
+        case "$line" in
+            *OP_ENV_WRAPPER_DEBUG*)
+                echo "genuine bypass message gated behind debug flag: $msg" >&2
+                return 1
+                ;;
+        esac
+    done
+}
+
+@test "a successful keyring recovery is quiet by default (only a genuine bypass is loud)" {
+    # Recovery is the NORMAL path on any host where @s is revoked by
+    # construction (a detached tmux server, sudo with no pam_keyinit) —
+    # not an anomaly, so it must not print unconditionally on every single
+    # invocation. Unlike the four genuine-bypass messages above, this one
+    # MUST be gated behind OP_ENV_WRAPPER_DEBUG=1: an unconditional message
+    # here trains callers to filter it out and corrupts any caller that
+    # merges stdout+stderr expecting only the wrapped command's own output
+    # (this repo's own integration suite hit exactly that).
     grep -Fq 'session keyring (@s) was unusable' "$RENDERED"
-    grep -Fq 'session keyring (@s) is unusable and a fresh one could not be created' "$RENDERED"
-    grep -Fq 'still unusable after one re-exec attempt' "$RENDERED"
-    grep -Fq 'keyctl not found on PATH' "$RENDERED"
-    grep -Fq 'failed to store the resolved Environment' "$RENDERED"
+    grep -Fq 'if [ "${OP_ENV_WRAPPER_DEBUG:-0}" = 1 ]; then' "$RENDERED"
 }
 
 @test "a malformed OP_ENV_WRAPPER_CACHE_TTL is normalized to 0 (disabled), not a crash" {
@@ -605,6 +630,35 @@ EOF
     [ "$status" -eq 0 ]
     [[ "$output" == *"from-cache"* ]]
     [[ "$output" != *"FAKE OP WAS CALLED"* ]]
+    # Recovery is the NORMAL path on a host where @s is revoked by
+    # construction, not an anomaly — the diagnostic must stay quiet by
+    # default (OP_ENV_WRAPPER_DEBUG unset here) or it would fire on
+    # essentially every invocation on such a host.
+    [[ "$output" != *"session keyring (@s) was unusable"* ]]
+}
+
+@test "live: OP_ENV_WRAPPER_DEBUG=1 makes a successful keyring recovery visible on request" {
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    local cache_desc="op-env-wrapper-cache:sample:env-SAMPLE"
+    run env -u OPENV_KEYRING_REEXEC \
+        OP_ENV_WRAPPER_DEBUG=1 \
+        OP_SERVICE_ACCOUNT_TOKEN=dummy-token-value \
+        WRAPPER_STAGE=2 \
+        keyctl session - bash -c '
+            set -e
+            persistent_kr="$(keyctl get_persistent @s)"
+            keyctl purge -p user "$1" >/dev/null 2>&1 || true
+            key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$1" "$persistent_kr")"
+            keyctl timeout "$key_id" 60
+            keyctl revoke @s
+            exec "$2" printenv CACHED_VAR
+        ' _ "$cache_desc" "$RENDERED_SELF"
+
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"from-cache"* ]]
+    [[ "$output" == *"session keyring (@s) was unusable"* ]]
 }
 
 @test "live: a plain @u keyring key is unreadable across a setpriv-only uid transition (the exact bug this design avoids)" {
