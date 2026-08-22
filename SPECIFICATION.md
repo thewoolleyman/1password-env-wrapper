@@ -708,14 +708,17 @@ covers all three:
      it is left off and no `XDG_RUNTIME_DIR` carry-through is added. The
      real rate-limit levers are reducing call volume and the account
      tier;
-   - **when the TTL cache (below) is disabled or misses**, run
-     `op run --no-masking --environment <ONEPASSWORD_ENVIRONMENT_ID>
-     -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE <command>`
-     so the final child sees neither the service-account token nor
-     the internal `WRAPPER_STAGE` sentinel. Stripping `WRAPPER_STAGE`
-     lets one wrapper invoke another (a nested wrapper) without the
-     inner wrapper inheriting a stale stage and skipping its own
-     stages. As with Stage 1's `env -i`, this `env -u …` invocation
+   - **when the TTL cache (below) is disabled, unrecoverable, or
+     misses**, run `op run --no-masking --environment
+     <ONEPASSWORD_ENVIRONMENT_ID> -- env -u OP_SERVICE_ACCOUNT_TOKEN
+     -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC <command>` so the final
+     child sees neither the service-account token, the internal
+     `WRAPPER_STAGE` sentinel, nor the internal cache-recovery guard
+     `OPENV_KEYRING_REEXEC` (see the TTL cache section below).
+     Stripping `WRAPPER_STAGE` lets one wrapper invoke another (a
+     nested wrapper) without the inner wrapper inheriting a stale
+     stage and skipping its own stages. As with Stage 1's `env -i`,
+     this `env -u …` invocation
      uses no GNU-style `--` after its options (op's own `--`, which
      separates `op run` arguments from the child command, is kept).
      The wrapper SHALL NOT `exec` op: it runs op as a child so op's
@@ -857,14 +860,50 @@ entirely.
   `op run` call the uncached path costs today, for every Environment
   — caching never doubles op invocations, regardless of whether any
   value contains a literal newline.
-- A cache miss or **any** cache-path anomaly (a missing `keyctl`
-  binary, `keyctl get_persistent` failing, a malformed or unreadable
-  cache entry) SHALL fall open to the uncached `op run` path — never
-  to a broken or incorrect result.
+- **Revoked/unusable session keyring recovery.** `keyctl get_persistent
+  @s` fails whenever `@s` itself is dead — most commonly a session
+  keyring REVOKED by `pam_keyinit.so force revoke` at SSH logout, for
+  a process that outlives that login (a detached `tmux` server
+  reparented to init, `sudo` — which has no `pam_keyinit` of its own
+  and so only ever *inherits* whatever `@s` it was handed, never
+  refreshes it). `@s` is still the correct destination (it is what
+  children inherit; `@p`/`@t`/`@u` do not survive the `setpriv`
+  privilege drop as genuine possessions — see above), so on a `@s`
+  failure Stage 2 SHALL attempt exactly **one** recovery: probe
+  whether a fresh anonymous session keyring can be created at all
+  (`keyctl session - true`, run to completion, not exec'd — this
+  catches a `kernel.keys.maxkeys`/`maxbytes` quota failure *before*
+  committing, since exec'ing directly into a `keyctl` that then fails
+  to create the session would replace the wrapper process with
+  nothing and the real command would never run); if the probe
+  succeeds, re-exec `"$INSTALLED_WRAPPER" "$@"` under `keyctl session
+  -`, carrying the current environment forward unchanged plus one
+  guard variable, `OPENV_KEYRING_REEXEC=1`, set by this same `env`
+  call. Stage 2 re-enters itself directly (never back through Stage
+  0/1, so stage 1's `env -i` never scrubs this guard) and checks the
+  guard before attempting recovery again, bounding it to exactly one
+  retry. This guard is safe as an environment variable specifically
+  *because* the same script both writes and reads it across a single
+  self-administered hop it fully controls — unlike a re-exec guard
+  meant to survive a boundary the guarding code does not control
+  (e.g. an external command re-exec'ing itself through a *different*
+  program that is free to rebuild its child's environment wholesale),
+  which environment variables cannot reliably survive.
+- A cache miss or **any** cache-path anomaly that recovery does not
+  resolve (a missing `keyctl` binary, `keyctl get_persistent` still
+  failing after the one re-exec attempt, a malformed or unreadable
+  cache entry, `keyctl padd` failing to store a resolved diff —
+  commonly a keyring quota exceeded) SHALL fall open to the uncached
+  `op run` path — never to a broken or incorrect result. Every such
+  fall-open SHALL be reported on stderr naming the specific reason
+  (`OP_ENV_WRAPPER_CACHE_TTL=0`, an intentional opt-out, is excluded —
+  that is not an anomaly). Silence here previously let the cache run
+  at its uncached baseline, unnoticed, for the caching feature's
+  entire deployed life.
 - Both the cached-replay exec and the freshly-resolved-on-miss exec
-  SHALL strip `OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` from the
-  child exactly as the uncached path does, per the Environment
-  Variable Contract below.
+  SHALL strip `OP_SERVICE_ACCOUNT_TOKEN`, `WRAPPER_STAGE`, and
+  `OPENV_KEYRING_REEXEC` from the child exactly as the uncached path
+  does, per the Environment Variable Contract below.
 
 ### Environment Variable Contract
 

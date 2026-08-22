@@ -71,6 +71,19 @@ setup_file() {
     fi
 
     bash "$harness"
+
+    # A second rendering, identical except INSTALLED_WRAPPER points at
+    # itself instead of a fake /usr/local/bin path — matching how a real
+    # installed wrapper's INSTALLED_WRAPPER always resolves to its own
+    # location. The keyring re-exec test below needs this: stage 2's
+    # revoked-@s recovery re-execs `"$INSTALLED_WRAPPER" "$@"`, and that
+    # must land back on a file that actually exists on disk.
+    RENDERED_SELF="$BATS_FILE_TMPDIR/with-selfpath-env.sh"
+    export RENDERED_SELF
+    local harness_self="$BATS_FILE_TMPDIR/render-harness-self.sh"
+    sed "s#INSTALLED_WRAPPER='/usr/local/bin/with-sample-env.sh'#INSTALLED_WRAPPER='$RENDERED_SELF'#" "$harness" \
+        | sed "s#render_wrapper .*#render_wrapper '$RENDERED_SELF'#" > "$harness_self"
+    bash "$harness_self"
 }
 
 # The exact OPENV_PRESERVE_VARS array-build logic from the wrapper
@@ -141,13 +154,15 @@ build_preserve() {
     grep -Eq 'setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\?$' "$RENDERED"
 }
 
-@test "Linux stage-2 final exec strips OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE (bug-fix 2)" {
-    grep -Fq 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"' "$RENDERED"
+@test "Linux stage-2 final exec strips OP_SERVICE_ACCOUNT_TOKEN, WRAPPER_STAGE and OPENV_KEYRING_REEXEC (bug-fix 2)" {
+    grep -Fq 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "$@"' "$RENDERED"
 }
 
-@test "macOS final exec strips OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE (bug-fix 2)" {
-    # Two occurrences total of the strip pattern: one Linux, one macOS.
-    run grep -cF 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"' "$RENDERED"
+@test "macOS final exec strips OP_SERVICE_ACCOUNT_TOKEN, WRAPPER_STAGE and OPENV_KEYRING_REEXEC (bug-fix 2)" {
+    # Two occurrences total of the strip pattern: one Linux, one macOS. The
+    # macOS branch never sets OPENV_KEYRING_REEXEC itself, but strips it too
+    # for hygiene, in case a caller's ambient env carried it in.
+    run grep -cF 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "$@"' "$RENDERED"
     [ "$output" -eq 2 ]
 }
 
@@ -325,8 +340,37 @@ default_drop_branch() {
 
 @test "cache is gated on OP_ENV_WRAPPER_CACHE_TTL (default 300s), keyctl, and get_persistent availability" {
     grep -Fq 'cache_ttl="${OP_ENV_WRAPPER_CACHE_TTL:-300}"' "$RENDERED"
-    grep -Fq 'if [ "$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1 \' "$RENDERED"
-    grep -Fq '&& persistent_kr="$(keyctl get_persistent @s 2>/dev/null)"; then' "$RENDERED"
+    grep -Fq 'command -v keyctl >/dev/null 2>&1 && keyctl_available=1' "$RENDERED"
+    grep -Fq 'if [ "$cache_ttl" -gt 0 ] && [ "$keyctl_available" -eq 1 ]; then' "$RENDERED"
+    grep -Fq 'persistent_kr="$(keyctl get_persistent @s 2>/dev/null)"' "$RENDERED"
+    grep -Fq 'if [ -n "$persistent_kr" ]; then' "$RENDERED"
+}
+
+@test "a revoked/unusable session keyring (@s) triggers exactly one re-exec under a fresh session, never a loop" {
+    # Bug-fix 3: PR #9's own predecessor bug was invisible in every
+    # synthetic bash-to-bash test because an interactive login shell's
+    # session keyring already worked via PAM. A dead/revoked @s (a detached
+    # tmux server, sudo with no pam_keyinit) is the actual failure mode, and
+    # the guard that stops this from looping forever must not depend on
+    # anything OTHER than this one exec call, since nothing else scrubs the
+    # environment on this hop (unlike stage 1's env -i).
+    grep -Fq '[ "${OPENV_KEYRING_REEXEC:-0}" != 1 ]' "$RENDERED"
+    grep -Fq 'exec env OPENV_KEYRING_REEXEC=1 keyctl session - "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
+    # The retry is gated behind a non-exec'd probe so an EDQUOT/maxkeys
+    # failure creating the fresh session is caught before committing via
+    # exec — otherwise the user's real command would never run.
+    grep -Fq 'if keyctl session - true >/dev/null 2>&1; then' "$RENDERED"
+}
+
+@test "every cache-bypass reason is reported loudly on stderr, naming which one" {
+    # Silence is what let this run at the uncached 8.5s baseline, unnoticed,
+    # for the caching feature's entire life. TTL=0 is excluded: that's a
+    # deliberate opt-out, not a bypass.
+    grep -Fq 'session keyring (@s) was unusable' "$RENDERED"
+    grep -Fq 'session keyring (@s) is unusable and a fresh one could not be created' "$RENDERED"
+    grep -Fq 'still unusable after one re-exec attempt' "$RENDERED"
+    grep -Fq 'keyctl not found on PATH' "$RENDERED"
+    grep -Fq 'failed to store the resolved Environment' "$RENDERED"
 }
 
 @test "a malformed OP_ENV_WRAPPER_CACHE_TTL is normalized to 0 (disabled), not a crash" {
@@ -369,11 +413,12 @@ default_drop_branch() {
     grep -Fq '*=*) ;;' "$RENDERED"
 }
 
-@test "both cache-path child execs strip OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE" {
+@test "both cache-path child execs strip OP_SERVICE_ACCOUNT_TOKEN, WRAPPER_STAGE and OPENV_KEYRING_REEXEC" {
     # One for the cache-hit replay, one for the freshly-resolved cache-miss
     # launch — both bypass op entirely for the child, so both must repeat
-    # the same -u strip the uncached op-run path gets from op's own env -u.
-    run grep -cF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign[@]}" "$@"' "$RENDERED"
+    # the same -u strip the uncached op-run path gets from op's own env -u,
+    # plus the internal re-exec guard so it never leaks into the user's cmd.
+    run grep -cF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "${assign[@]}" "$@"' "$RENDERED"
     [ "$output" -eq 2 ]
 }
 
@@ -467,33 +512,99 @@ diff_injected_vars() {
     if ! command -v keyctl >/dev/null 2>&1; then
         skip "keyctl (keyutils) not installed on this host"
     fi
-    # Needed so mapfile, on the right of the pipe below, populates `replay`
-    # in this shell rather than a subshell — same reason the rendered
-    # wrapper itself enables it before using this pattern.
-    shopt -s lastpipe
-    local desc="wrapper-render-bats-test:$$"
-    local persistent_kr
-    persistent_kr="$(keyctl get_persistent @s)"
-    keyctl purge -p user "$desc" >/dev/null 2>&1 || true
+    # Run entirely inside a fresh `keyctl session -` rather than trusting
+    # the ambient @s of whatever process happens to be running bats: on a
+    # host with a revoked @s (a detached tmux server, sudo with no
+    # pam_keyinit — see bug-fix 3 below) the bats process's own @s can be
+    # just as dead as the wrapper's ever was, which would fail this test
+    # for a reason that has nothing to do with the round-trip logic it's
+    # meant to check.
+    run keyctl session - bash -c '
+        set -e
+        # Needed so mapfile, on the right of the pipe below, populates
+        # `replay` in this shell rather than a subshell — same reason the
+        # rendered wrapper itself enables it before using this pattern.
+        shopt -s lastpipe
+        desc="wrapper-render-bats-test:$$"
+        persistent_kr="$(keyctl get_persistent @s)"
+        keyctl purge -p user "$desc" >/dev/null 2>&1 || true
 
-    local pem=$'-----BEGIN KEY-----\nMIIEpQIBAAKC\nsomeline==\n-----END KEY-----'
-    local key_id
-    key_id="$(printf '%s\0' 'TEST_FOO=hello' "PEM_KEY=$pem" | keyctl padd user "$desc" "$persistent_kr")"
-    keyctl timeout "$key_id" 2
+        pem=$'"'"'-----BEGIN KEY-----\nMIIEpQIBAAKC\nsomeline==\n-----END KEY-----'"'"'
+        key_id="$(printf '"'"'%s\0'"'"' "TEST_FOO=hello" "PEM_KEY=$pem" | keyctl padd user "$desc" "$persistent_kr")"
+        keyctl timeout "$key_id" 2
 
-    local found_id
-    found_id="$(keyctl search "$persistent_kr" user "$desc")"
-    [ "$found_id" = "$key_id" ]
+        found_id="$(keyctl search "$persistent_kr" user "$desc")"
+        [ "$found_id" = "$key_id" ]
 
-    local replay=()
-    keyctl pipe "$found_id" | mapfile -d '' -t replay
-    [ "${#replay[@]}" -eq 2 ]
-    [ "${replay[0]}" = "TEST_FOO=hello" ]
-    [ "${replay[1]}" = "PEM_KEY=$pem" ]
+        replay=()
+        keyctl pipe "$found_id" | mapfile -d "" -t replay
+        [ "${#replay[@]}" -eq 2 ]
+        [ "${replay[0]}" = "TEST_FOO=hello" ]
+        [ "${replay[1]}" = "PEM_KEY=$pem" ]
 
-    sleep 3
-    run keyctl search "$persistent_kr" user "$desc"
-    [ "$status" -ne 0 ]
+        sleep 3
+        if keyctl search "$persistent_kr" user "$desc" >/dev/null 2>&1; then
+            echo "STILL PRESENT AFTER TTL" >&2
+            exit 1
+        fi
+        echo "ROUND_TRIP_OK"
+    '
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"ROUND_TRIP_OK"* ]]
+}
+
+@test "live: a REVOKED session keyring (@s) recovers via re-exec and reaches a cache HIT — zero op calls (bug-fix 3)" {
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    # This is the regression PR #9's own commit message warned about and
+    # then reproduced one level up: its predecessor bug "was invisible in
+    # every synthetic bash-to-bash test (an interactive login shell's
+    # session already possesses @u via PAM at SSH login)". A bash-to-bash
+    # test with a HEALTHY @s would be exactly that blind spot again. This
+    # test instead forces @s into the REVOKED state PR #9 never covered
+    # (a detached tmux server, sudo with no pam_keyinit — see the module
+    # header) and asserts a cache HIT, not merely a successful exit: a
+    # fake `op` on PATH that hard-fails if invoked proves the wrapper
+    # never fell through to the uncached path despite @s being dead.
+    # Deliberately do NOT touch keyctl in bats' own ambient shell here —
+    # this test must not depend on whether the process running bats
+    # itself happens to have a live @s (it may well not; that is the
+    # whole premise). The pre-seed, the revoke, and the wrapper re-exec
+    # all happen inside ONE fresh, self-contained session below.
+    local cache_desc="op-env-wrapper-cache:sample:env-SAMPLE"
+
+    local fakebin="$BATS_TEST_TMPDIR/fakebin"
+    mkdir -p "$fakebin"
+    cat > "$fakebin/op" <<'EOF'
+#!/usr/bin/env bash
+echo "FAKE OP WAS CALLED (should never happen on a cache hit): $*" >&2
+exit 1
+EOF
+    chmod +x "$fakebin/op"
+
+    run env -u OPENV_KEYRING_REEXEC \
+        PATH="$fakebin:$PATH" \
+        OP_SERVICE_ACCOUNT_TOKEN=dummy-token-value \
+        WRAPPER_STAGE=2 \
+        keyctl session - bash -c '
+            set -e
+            persistent_kr="$(keyctl get_persistent @s)"
+            keyctl purge -p user "$1" >/dev/null 2>&1 || true
+            key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$1" "$persistent_kr")"
+            keyctl timeout "$key_id" 60
+            keyctl revoke @s
+            exec "$2" printenv CACHED_VAR
+        ' _ "$cache_desc" "$RENDERED_SELF"
+
+    # `keyctl session` itself writes an informational "Joined session
+    # keyring: N" line to stderr on every join (both the outer setup join
+    # and the wrapper's own recovery join), which `run` folds into
+    # $output alongside our err() diagnostics — so assert containment and
+    # the absence of the fake-op tripwire, not an exact match.
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"from-cache"* ]]
+    [[ "$output" != *"FAKE OP WAS CALLED"* ]]
 }
 
 @test "live: a plain @u keyring key is unreadable across a setpriv-only uid transition (the exact bug this design avoids)" {
