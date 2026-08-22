@@ -711,10 +711,8 @@ covers all three:
    - **when the TTL cache (below) is disabled, unrecoverable, or
      misses**, run `op run --no-masking --environment
      <ONEPASSWORD_ENVIRONMENT_ID> -- env -u OP_SERVICE_ACCOUNT_TOKEN
-     -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC <command>` so the final
-     child sees neither the service-account token, the internal
-     `WRAPPER_STAGE` sentinel, nor the internal cache-recovery guard
-     `OPENV_KEYRING_REEXEC` (see the TTL cache section below).
+     -u WRAPPER_STAGE <command>` so the final child sees neither the
+     service-account token nor the internal `WRAPPER_STAGE` sentinel.
      Stripping `WRAPPER_STAGE` lets one wrapper invoke another (a
      nested wrapper) without the inner wrapper inheriting a stale
      stage and skipping its own stages. As with Stage 1's `env -i`,
@@ -869,49 +867,57 @@ entirely.
   refreshes it). `@s` is still the correct destination (it is what
   children inherit; `@p`/`@t`/`@u` do not survive the `setpriv`
   privilege drop as genuine possessions — see above), so on a `@s`
-  failure Stage 2 SHALL attempt exactly **one** recovery: probe
-  whether a fresh anonymous session keyring can be created at all
-  (`keyctl session - true`, run to completion, not exec'd — this
-  catches a `kernel.keys.maxkeys`/`maxbytes` quota failure *before*
-  committing, since exec'ing directly into a `keyctl` that then fails
-  to create the session would replace the wrapper process with
-  nothing and the real command would never run); if the probe
-  succeeds, re-exec `"$INSTALLED_WRAPPER" "$@"` under `keyctl session
-  -`, carrying the current environment forward unchanged plus one
-  guard variable, `OPENV_KEYRING_REEXEC=1`, set by this same `env`
-  call. Stage 2 re-enters itself directly (never back through Stage
-  0/1, so stage 1's `env -i` never scrubs this guard) and checks the
-  guard before attempting recovery again, bounding it to exactly one
-  retry. This guard is safe as an environment variable specifically
-  *because* the same script both writes and reads it across a single
-  self-administered hop it fully controls — unlike a re-exec guard
-  meant to survive a boundary the guarding code does not control
-  (e.g. an external command re-exec'ing itself through a *different*
-  program that is free to rebuild its child's environment wholesale),
-  which environment variables cannot reliably survive. A successful
-  recovery is SILENT by default: on a host where `@s` is revoked by
-  construction (the PAM configuration above), recovery is the
-  *normal* path, not an anomaly, and would otherwise fire on
-  essentially every invocation — training callers to filter it out,
-  and corrupting any caller that merges stdout+stderr expecting only
-  the wrapped command's own output. Set `OP_ENV_WRAPPER_DEBUG=1` to
-  see it. This is distinct from the genuine-bypass messages below,
-  which stay unconditional.
+  failure Stage 2 SHALL recover by calling `keyctl new_session` — the
+  same session-keyring-join operation `keyctl session -` performs,
+  but on THIS already-running process directly: no exec, no child, no
+  re-entry into this script. If it fails (e.g. a keyring quota
+  exceeded), this process is completely unaffected and simply falls
+  through to the uncached path below, exactly like any other
+  cache-path anomaly. There is no re-exec to guard, no probe-then-commit
+  step, and no recursion to bound, because nothing ever re-enters this
+  script — an earlier design re-exec'd the wrapper under a guarded
+  retry and needed all three; this one needs none of them by
+  construction.
+  MEASURED, not merely reasoned: this recovery is not purely local to
+  the calling process. A process whose `@s` is revoked/absent falls
+  back to a shared per-uid keyring, and `keyctl new_session` appears
+  to re-mint that shared fallback — a sibling process in the same
+  state was observed to heal the instant this ran, with no re-exec of
+  its own. Confirmed this does NOT disturb a process that already has
+  its own distinct, healthy session keyring (such a process is not
+  looking at the shared fallback in the first place). Recorded as
+  measured behavior, not theory, since the exact kernel mechanism was
+  not independently verified beyond this observation.
+  `>/dev/null 2>&1` on BOTH streams around this call is load-bearing:
+  `keyctl new_session` prints a bare keyring ID to **stdout**
+  (confirmed by direct measurement), unlike `keyctl session -`'s
+  "Joined session keyring: N" banner, which goes to stderr. A stray
+  integer on stdout would corrupt every caller's payload channel, not
+  only ones that merge stdout+stderr — strictly worse than the banner
+  it replaces, which only ever hit merged-stream callers (one of
+  which, downstream of this wrapper, hit exactly that: JSON output
+  corrupted by the banner landing before the payload). A successful
+  recovery is otherwise SILENT by default: on a host where `@s` is
+  revoked by construction (the PAM configuration above), recovery is
+  the *normal* path, not an anomaly, and would otherwise fire on
+  essentially every invocation — training callers to filter it out.
+  Set `OP_ENV_WRAPPER_DEBUG=1` to see it. This is distinct from the
+  genuine-bypass messages below, which stay unconditional.
 - A cache miss or **any** cache-path anomaly that recovery does not
   resolve (a missing `keyctl` binary, `keyctl get_persistent` still
-  failing after the one re-exec attempt, a malformed or unreadable
-  cache entry, `keyctl padd` failing to store a resolved diff —
-  commonly a keyring quota exceeded) SHALL fall open to the uncached
-  `op run` path — never to a broken or incorrect result. Every such
-  fall-open SHALL be reported on stderr naming the specific reason
+  failing after `keyctl new_session`, a malformed or unreadable cache
+  entry, `keyctl padd` failing to store a resolved diff — commonly a
+  keyring quota exceeded) SHALL fall open to the uncached `op run`
+  path — never to a broken or incorrect result. Every such fall-open
+  SHALL be reported on stderr naming the specific reason
   (`OP_ENV_WRAPPER_CACHE_TTL=0`, an intentional opt-out, is excluded —
   that is not an anomaly). Silence here previously let the cache run
   at its uncached baseline, unnoticed, for the caching feature's
   entire deployed life.
 - Both the cached-replay exec and the freshly-resolved-on-miss exec
-  SHALL strip `OP_SERVICE_ACCOUNT_TOKEN`, `WRAPPER_STAGE`, and
-  `OPENV_KEYRING_REEXEC` from the child exactly as the uncached path
-  does, per the Environment Variable Contract below.
+  SHALL strip `OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` from the
+  child exactly as the uncached path does, per the Environment
+  Variable Contract below.
 
 ### Environment Variable Contract
 

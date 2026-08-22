@@ -154,15 +154,13 @@ build_preserve() {
     grep -Eq 'setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\?$' "$RENDERED"
 }
 
-@test "Linux stage-2 final exec strips OP_SERVICE_ACCOUNT_TOKEN, WRAPPER_STAGE and OPENV_KEYRING_REEXEC (bug-fix 2)" {
-    grep -Fq 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "$@"' "$RENDERED"
+@test "Linux stage-2 final exec strips OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE (bug-fix 2)" {
+    grep -Fq 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"' "$RENDERED"
 }
 
-@test "macOS final exec strips OP_SERVICE_ACCOUNT_TOKEN, WRAPPER_STAGE and OPENV_KEYRING_REEXEC (bug-fix 2)" {
-    # Two occurrences total of the strip pattern: one Linux, one macOS. The
-    # macOS branch never sets OPENV_KEYRING_REEXEC itself, but strips it too
-    # for hygiene, in case a caller's ambient env carried it in.
-    run grep -cF 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "$@"' "$RENDERED"
+@test "macOS final exec strips OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE (bug-fix 2)" {
+    # Two occurrences total of the strip pattern: one Linux, one macOS.
+    run grep -cF 'env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "$@"' "$RENDERED"
     [ "$output" -eq 2 ]
 }
 
@@ -346,31 +344,39 @@ default_drop_branch() {
     grep -Fq 'if [ -n "$persistent_kr" ]; then' "$RENDERED"
 }
 
-@test "a revoked/unusable session keyring (@s) triggers exactly one re-exec under a fresh session, never a loop" {
+@test "a revoked/unusable session keyring (@s) recovers in-place via keyctl new_session, no re-exec" {
     # Bug-fix 3: PR #9's own predecessor bug was invisible in every
     # synthetic bash-to-bash test because an interactive login shell's
     # session keyring already worked via PAM. A dead/revoked @s (a detached
-    # tmux server, sudo with no pam_keyinit) is the actual failure mode, and
-    # the guard that stops this from looping forever must not depend on
-    # anything OTHER than this one exec call, since nothing else scrubs the
-    # environment on this hop (unlike stage 1's env -i).
-    grep -Fq '[ "${OPENV_KEYRING_REEXEC:-0}" != 1 ]' "$RENDERED"
-    grep -Fq 'exec env OPENV_KEYRING_REEXEC=1 keyctl session - "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
-    # The retry is gated behind a non-exec'd probe so an EDQUOT/maxkeys
-    # failure creating the fresh session is caught before committing via
-    # exec — otherwise the user's real command would never run.
-    grep -Fq 'if keyctl session - true >/dev/null 2>&1; then' "$RENDERED"
+    # tmux server, sudo with no pam_keyinit) is the actual failure mode.
+    #
+    # `keyctl new_session` joins a fresh anonymous session keyring on the
+    # ALREADY-RUNNING process directly (the same underlying join operation
+    # `keyctl session -` performs, but without forking/exec'ing a subcommand)
+    # — so recovery never re-enters this script. That eliminates an entire
+    # class of past design (re-exec + recursion guard) rather than merely
+    # gating it: there is nothing to bound, no probe-then-commit dance
+    # needed (a failed join leaves this process completely unaffected, so
+    # it simply falls through), and — the concrete regression that forced
+    # this redesign — no risk of `keyctl session -`'s own "Joined session
+    # keyring: N" prose banner landing on a caller's stdout when merged
+    # with stderr (a real downstream caller did exactly that and had its
+    # JSON output corrupted). `new_session` only ever emits a bare keyring
+    # ID, fully discarded here.
+    grep -Fq 'if keyctl new_session >/dev/null 2>&1; then' "$RENDERED"
+    ! grep -Fq 'OPENV_KEYRING_REEXEC' "$RENDERED"
+    ! grep -Eq 'exec.*keyctl session' "$RENDERED"
 }
 
 @test "every genuine cache-bypass reason is reported loudly and unconditionally on stderr" {
     # Silence is what let this run at the uncached 8.5s baseline, unnoticed,
     # for the caching feature's entire life. TTL=0 is excluded: that's a
-    # deliberate opt-out, not a bypass. These four ARE genuine bypasses —
+    # deliberate opt-out, not a bypass. These three ARE genuine bypasses —
     # the cache really was skipped and the caller really pays full op-run
     # cost — so none of them may be gated behind OP_ENV_WRAPPER_DEBUG.
     for msg in \
         'session keyring (@s) is unusable and a fresh one could not be created' \
-        'still unusable after one re-exec attempt' \
+        'joined a fresh session keyring but still could not obtain the persistent keyring' \
         'keyctl not found on PATH' \
         'failed to store the resolved Environment'
     do
@@ -389,11 +395,9 @@ default_drop_branch() {
     # Recovery is the NORMAL path on any host where @s is revoked by
     # construction (a detached tmux server, sudo with no pam_keyinit) —
     # not an anomaly, so it must not print unconditionally on every single
-    # invocation. Unlike the four genuine-bypass messages above, this one
-    # MUST be gated behind OP_ENV_WRAPPER_DEBUG=1: an unconditional message
-    # here trains callers to filter it out and corrupts any caller that
-    # merges stdout+stderr expecting only the wrapped command's own output
-    # (this repo's own integration suite hit exactly that).
+    # invocation. Unlike the genuine-bypass messages above, this one MUST
+    # be gated behind OP_ENV_WRAPPER_DEBUG=1: an unconditional message here
+    # trains callers to filter it out.
     grep -Fq 'session keyring (@s) was unusable' "$RENDERED"
     grep -Fq 'if [ "${OP_ENV_WRAPPER_DEBUG:-0}" = 1 ]; then' "$RENDERED"
 }
@@ -438,12 +442,11 @@ default_drop_branch() {
     grep -Fq '*=*) ;;' "$RENDERED"
 }
 
-@test "both cache-path child execs strip OP_SERVICE_ACCOUNT_TOKEN, WRAPPER_STAGE and OPENV_KEYRING_REEXEC" {
+@test "both cache-path child execs strip OP_SERVICE_ACCOUNT_TOKEN and WRAPPER_STAGE" {
     # One for the cache-hit replay, one for the freshly-resolved cache-miss
     # launch — both bypass op entirely for the child, so both must repeat
-    # the same -u strip the uncached op-run path gets from op's own env -u,
-    # plus the internal re-exec guard so it never leaks into the user's cmd.
-    run grep -cF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "${assign[@]}" "$@"' "$RENDERED"
+    # the same -u strip the uncached op-run path gets from op's own env -u.
+    run grep -cF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign[@]}" "$@"' "$RENDERED"
     [ "$output" -eq 2 ]
 }
 
@@ -578,7 +581,7 @@ diff_injected_vars() {
     [[ "$output" == *"ROUND_TRIP_OK"* ]]
 }
 
-@test "live: a REVOKED session keyring (@s) recovers via re-exec and reaches a cache HIT — zero op calls (bug-fix 3)" {
+@test "live: a REVOKED session keyring (@s) recovers in-place and reaches a cache HIT — zero op calls (bug-fix 3)" {
     if ! command -v keyctl >/dev/null 2>&1; then
         skip "keyctl (keyutils) not installed on this host"
     fi
@@ -592,11 +595,13 @@ diff_injected_vars() {
     # header) and asserts a cache HIT, not merely a successful exit: a
     # fake `op` on PATH that hard-fails if invoked proves the wrapper
     # never fell through to the uncached path despite @s being dead.
-    # Deliberately do NOT touch keyctl in bats' own ambient shell here —
+    # Deliberately do NOT touch keyctl in bats' own ambient shell here --
     # this test must not depend on whether the process running bats
     # itself happens to have a live @s (it may well not; that is the
-    # whole premise). The pre-seed, the revoke, and the wrapper re-exec
-    # all happen inside ONE fresh, self-contained session below.
+    # whole premise). The pre-seed, the revoke, and the wrapper invocation
+    # all happen inside ONE fresh, self-contained session below -- the
+    # wrapper's own recovery (keyctl new_session) never spawns a second
+    # one, unlike the old re-exec design.
     local cache_desc="op-env-wrapper-cache:sample:env-SAMPLE"
 
     local fakebin="$BATS_TEST_TMPDIR/fakebin"
@@ -608,7 +613,7 @@ exit 1
 EOF
     chmod +x "$fakebin/op"
 
-    run env -u OPENV_KEYRING_REEXEC \
+    run env \
         PATH="$fakebin:$PATH" \
         OP_SERVICE_ACCOUNT_TOKEN=dummy-token-value \
         WRAPPER_STAGE=2 \
@@ -622,11 +627,6 @@ EOF
             exec "$2" printenv CACHED_VAR
         ' _ "$cache_desc" "$RENDERED_SELF"
 
-    # `keyctl session` itself writes an informational "Joined session
-    # keyring: N" line to stderr on every join (both the outer setup join
-    # and the wrapper's own recovery join), which `run` folds into
-    # $output alongside our err() diagnostics — so assert containment and
-    # the absence of the fake-op tripwire, not an exact match.
     [ "$status" -eq 0 ]
     [[ "$output" == *"from-cache"* ]]
     [[ "$output" != *"FAKE OP WAS CALLED"* ]]
@@ -635,6 +635,78 @@ EOF
     # default (OP_ENV_WRAPPER_DEBUG unset here) or it would fire on
     # essentially every invocation on such a host.
     [[ "$output" != *"session keyring (@s) was unusable"* ]]
+    # Regression guard for the actual bug that forced this redesign: the
+    # OLD re-exec design spawned a SECOND `keyctl session -` from inside
+    # the wrapper's own recovery, printing a second "Joined session
+    # keyring: N" banner that corrupted a real downstream caller's stdout
+    # when merged with stderr. `keyctl new_session` never forks/execs, so
+    # only the outer setup's ONE join banner should ever appear here.
+    banner_count="$(printf '%s\n' "$output" | grep -c 'Joined session keyring' || true)"
+    [ "$banner_count" -eq 1 ]
+}
+
+@test "live: a revoked-@s recovery never pollutes the wrapped command's stdout, even under 2>&1" {
+    # Directly reproduces the real downstream regression this design fix
+    # exists for: openbrain/scripts/verify-openbrain-env.sh does
+    # `env_dump="$("$WRAPPER" python3 -c '...json.dumps(os.environ)...' 2>&1)"`
+    # -- a merged capture expecting PURE JSON on stdout. The OLD re-exec
+    # design's `keyctl session -` printed "Joined session keyring: N" to
+    # STDERR, which corrupted env_dump the moment @s was revoked. Fixing
+    # only that would still have left `keyctl new_session` free to print
+    # its own bare keyring ID straight to STDOUT (confirmed by direct
+    # measurement) -- worse, since that would corrupt every caller's
+    # payload channel, not just ones that merge streams. Assert BOTH: a
+    # stdout-only capture and a stdout+stderr merged capture produce
+    # IDENTICAL bytes on stdout, and that stdout is valid, parseable JSON.
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        skip "python3 not installed on this host"
+    fi
+    local cache_desc="op-env-wrapper-cache:sample:env-SAMPLE"
+    local stdout_only="$BATS_TEST_TMPDIR/stdout_only.json"
+    local merged="$BATS_TEST_TMPDIR/merged.out"
+
+    # `keyctl new_session` (not the outer `keyctl session -` used
+    # elsewhere in this file) sets up the test's OWN throwaway session, so
+    # the test harness itself contributes no "Joined session keyring: N"
+    # banner to compare against — otherwise that banner (a property of
+    # THIS TEST's setup, unrelated to the wrapper under test) would show
+    # up in the merged capture but not the stdout-only one and produce a
+    # spurious diff. Every setup command's own output is discarded too,
+    # so the ONLY thing that can differ between the two captures below is
+    # whatever the WRAPPER itself does.
+    env \
+        OP_SERVICE_ACCOUNT_TOKEN=dummy-token-value \
+        WRAPPER_STAGE=2 \
+        bash -c '
+            set -e
+            keyctl new_session >/dev/null 2>&1
+            persistent_kr="$(keyctl get_persistent @s)"
+            keyctl purge -p user "$1" >/dev/null 2>&1 || true
+            key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$1" "$persistent_kr")"
+            keyctl timeout "$key_id" 60 >/dev/null 2>&1
+            keyctl revoke @s
+            exec "$2" python3 -c "import json,os; print(json.dumps({\"CACHED_VAR\": os.environ.get(\"CACHED_VAR\", \"\")}))"
+        ' _ "$cache_desc" "$RENDERED_SELF" > "$stdout_only" 2>/dev/null
+
+    env \
+        OP_SERVICE_ACCOUNT_TOKEN=dummy-token-value \
+        WRAPPER_STAGE=2 \
+        bash -c '
+            set -e
+            keyctl new_session >/dev/null 2>&1
+            persistent_kr="$(keyctl get_persistent @s)"
+            keyctl purge -p user "$1" >/dev/null 2>&1 || true
+            key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$1" "$persistent_kr")"
+            keyctl timeout "$key_id" 60 >/dev/null 2>&1
+            keyctl revoke @s
+            exec "$2" python3 -c "import json,os; print(json.dumps({\"CACHED_VAR\": os.environ.get(\"CACHED_VAR\", \"\")}))"
+        ' _ "$cache_desc" "$RENDERED_SELF" > "$merged" 2>&1
+
+    diff "$stdout_only" "$merged"
+    python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['CACHED_VAR']=='from-cache', d" "$merged"
 }
 
 @test "live: OP_ENV_WRAPPER_DEBUG=1 makes a successful keyring recovery visible on request" {
@@ -642,7 +714,7 @@ EOF
         skip "keyctl (keyutils) not installed on this host"
     fi
     local cache_desc="op-env-wrapper-cache:sample:env-SAMPLE"
-    run env -u OPENV_KEYRING_REEXEC \
+    run env \
         OP_ENV_WRAPPER_DEBUG=1 \
         OP_SERVICE_ACCOUNT_TOKEN=dummy-token-value \
         WRAPPER_STAGE=2 \
