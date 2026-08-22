@@ -220,6 +220,39 @@ automatically; no action is needed either way. Full design and
 failure-mode contract: SPECIFICATION.md § "TTL cache of the
 op-resolved environment".
 
+**A revoked/dead session keyring is the common case, not an edge
+case, and is handled automatically.** The Linux kernel session
+keyring (`@s`) that the cache lives behind gets REVOKED by
+`pam_keyinit.so force revoke` at SSH logout, and a process that
+outlives that login — a detached `tmux` server reparented to init, a
+long-lived daemon, `sudo` itself (no `pam_keyinit` of its own, so it
+only ever inherits whatever `@s` it was handed) — keeps running with
+a dead `@s` forever. The wrapper detects this and recovers in-place
+via `keyctl new_session` (no re-exec, no subprocess) before falling
+back to the uncached path. This is silent by default; set
+`OP_ENV_WRAPPER_DEBUG=1` to see the one-line stderr note when it
+fires. Any *unrecoverable* cache-path anomaly (keyutils missing, a
+keyring quota exceeded, `@s` still unusable after recovery) is always
+reported on stderr regardless of the debug flag — see
+SPECIFICATION.md § "Revoked/unusable session keyring recovery" for
+the measured behavior behind this (including that the recovery is
+NOT purely local to the calling process — see that section).
+
+**Keyring quota headroom matters once a host runs several
+identifiers.** Each cached Environment costs kernel memory against
+`kernel.keys.maxbytes`/`maxkeys` for the invoking uid (a resolved
+Environment with a couple of secrets is commonly several KB; a
+multi-line PEM-shaped secret pushes it further). The kernel
+defaults (`maxbytes=20000`, `maxkeys=200`) fit only 3-4 wrapper
+identifiers' worth of cache before `keyctl padd` starts failing with
+EDQUOT — silently, unless `OP_ENV_WRAPPER_DEBUG=1` or you're
+watching stderr, since a padd failure still lets the current call
+succeed (falling back to a live `op run` resolve every time,
+quietly re-consuming the 1Password service account's shared daily
+rate limit). If a host runs several distinct identifiers, raise
+`kernel.keys.maxbytes` and `kernel.keys.maxkeys` for that uid via a
+sysctl drop-in before relying on the cache across all of them.
+
 ## Open an interactive shell via the wrapper
 
 ```sh
@@ -256,7 +289,70 @@ Rerun the installer with the replacement
 No fetched Environment values, and no plaintext token, are
 persisted to disk at any point.
 
+## After changing the template: redeploy is manual, per host, per identifier
+
+A merged change to `create-1password-env-wrapper.sh` changes nothing
+on any already-installed wrapper by itself. Every host that has ever
+installed a wrapper carries a byte-frozen copy from whenever it was
+last (re-)installed — there is no update mechanism. After merging a
+template fix:
+
+- **Re-run the installer** for each affected `IDENTIFIER` on each
+  host that has it installed. The installer needs the identifier's
+  real `OP_SERVICE_ACCOUNT_TOKEN` again (it is not a pure
+  re-render); on Linux you can decrypt the *existing* sealed
+  credential as root (`systemd-creds decrypt --name=1password-env-wrapper-<id>
+  /etc/credstore.encrypted/1password-env-wrapper-<id> -`) and feed
+  that straight back into the installer's environment — no need to
+  go find the token anywhere else, and no need to expose it on a
+  command line or in a log.
+- **Verify with behavior, not exit status.** A wrapper that "runs
+  successfully" can still be running the OLD, buggy code path — for
+  example the pre-fix uncached path also exits 0, just slower and
+  wrapping the real command in a resident `op run` for its whole
+  life. Verify with what actually changed: a timing measurement
+  (cold vs. warm), absence of a lingering `op run` process around a
+  long-running real command, and — if the change touches
+  stdout/stderr behavior — a byte-comparison of a plain capture vs. a
+  `2>&1`-merged capture.
+- **Consumer repos that carry their own tracked copy of a rendered
+  wrapper drift independently.** At least `openbrain` and `resume`
+  commit their `with-<identifier>-env.sh` into their own repo
+  (`DO-NOT-EDIT` header, canonical source pointing back here) rather
+  than only relying on the installed copy — re-rendering on the host
+  does NOT update that tracked copy; it has to be copied over and
+  committed in that repo separately. `dolt-server`'s wrapper is a
+  different case entirely: it is adopter-owned, NOT rendered from
+  this template, and never calls `op` at all (systemd-creds-only
+  backend) — do not "fix" it as part of a template change; it is
+  out of scope by design.
+- **macOS has no keyring-based cache at all** (the Darwin branch has
+  no keyring code) — every call there is a full `op run`, always.
+  This is a known, pre-existing gap, not a regression from any
+  Linux-side cache fix, and is out of scope for a Linux keyring fix
+  unless the PR says otherwise.
+
 ## Running the integration test
+
+**Warning — this can silently reinstall a live production wrapper.**
+`test/integration.bats` defaults `INSTALL_PREFIX` to `/usr/local/bin`
+on Linux — the same location real wrappers are actually installed
+to. If you run this suite on a host that also runs a live wrapper
+for `IDENTIFIER=openbrain`, it reinstalls that production wrapper
+from whatever is in *your current working tree* — including a dirty
+or unmerged branch — with no confirmation and no log line calling it
+out. This already happened once (see
+[#12](https://github.com/thewoolleyman/1password-env-wrapper/issues/12)):
+running the suite once to satisfy "tests must stay green" before a
+PR quietly deployed that PR's own not-yet-merged code to production,
+and the resulting mismatch (installed file older than the PR it was
+supposedly testing, missing a commit that landed after) was initially
+mistaken for something else entirely before the actual cause —
+the test run — was traced down. Until #12 is fixed, treat
+`bats test/integration.bats` as a deploy action on any host that also
+runs a real installed wrapper for the identifier under test, not as a
+side-effect-free test run — check whether that identifier is live on
+the host you're about to run it on first.
 
 The repository ships a Bats integration test at
 `test/integration.bats` that drives the installer against real
