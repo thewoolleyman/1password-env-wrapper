@@ -1,5 +1,7 @@
 #!/usr/bin/env bats
 
+bats_require_minimum_version 1.5.0
+
 # Integration test for the 1Password Environment Wrapper Factory.
 # See SPECIFICATION.md, section "Integration Test: test/integration.bats".
 #
@@ -221,6 +223,20 @@ run_wrapper() {
     fi
 }
 
+# Like run_wrapper, but keeps stdout and stderr apart ($stdout / $stderr,
+# bats-core >=1.5). Needed for any assertion sensitive to the exact bytes
+# of the wrapped command's stdout: the TTL cache's loud bypass/recovery
+# diagnostics (bug-fix 3) are deliberately written to stderr, and `run`'s
+# default merged $output would otherwise fold them in and corrupt an
+# exact-match comparison against the wrapped command's real stdout.
+run_wrapper_separated() {
+    if [ "$PLATFORM" = "Linux" ]; then
+        run --separate-stderr sudo -u openbrain "$INSTALLED_WRAPPER" "$@"
+    else
+        run --separate-stderr "$INSTALLED_WRAPPER" "$@"
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Cross-platform tests (run on both Linux and macOS).
 # ---------------------------------------------------------------------------
@@ -267,10 +283,14 @@ run_wrapper() {
 
 @test "wrapper output is sorted by variable name" {
     [ -e "$INSTALLED_WRAPPER" ] || run_installer
-    run_wrapper "$STAGED_TARGET"
+    # print-test-env-vars.sh sorts its own printed TEST_* lines
+    # (SPECIFICATION.md "sort the output by variable name, ascending"),
+    # independent of process-environ ordering — so this is a check on
+    # STDOUT specifically, not on whatever else `run` may have captured.
+    run_wrapper_separated "$STAGED_TARGET"
     assert_success
-    sorted="$(printf '%s\n' "$output" | LC_ALL=C sort)"
-    [ "$output" = "$sorted" ]
+    sorted="$(printf '%s\n' "$stdout" | LC_ALL=C sort)"
+    [ "$stdout" = "$sorted" ]
 }
 
 @test "wrapper-spawned env shows Environment vars but not OP_SERVICE_ACCOUNT_TOKEN" {

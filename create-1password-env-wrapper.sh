@@ -47,6 +47,15 @@ if [ "$PLATFORM" = "Linux" ]; then
     command -v systemd-creds >/dev/null 2>&1 || die "systemd-creds is required (install systemd-container or upgrade systemd)"
     command -v setpriv       >/dev/null 2>&1 || die "setpriv is required (install util-linux)"
     [ "$(id -u)" -eq 0 ] || die "must run as root on Linux; rerun under: sudo -E ./$PROG"
+    # keyctl (keyutils) is NOT a hard requirement — the wrapper's stage 2
+    # gates its TTL cache on `command -v keyctl` and simply falls back to
+    # the uncached, pre-cache behavior when it's absent (with a loud
+    # stderr note on every call, naming the reason). Warn rather than
+    # die: caching is a latency/rate-limit optimization, not a
+    # correctness requirement, and this installer must keep working on a
+    # host that doesn't have (or doesn't want) keyutils installed.
+    command -v keyctl >/dev/null 2>&1 \
+        || err "keyutils ('keyctl') is not on PATH — the wrapper will still work, but every call will resolve via a full 'op run' instead of the TTL-cached path (install keyutils to enable caching)"
 else
     # macOS: `security` ships in /usr/bin and is part of the OS, so
     # this check is a belt-and-braces sanity test.
@@ -426,8 +435,85 @@ case "\$(uname -s)" in
                     ''|*[!0-9]*) cache_ttl=0 ;;  # malformed -> disabled, fail open
                 esac
 
-                if [ "\$cache_ttl" -gt 0 ] && command -v keyctl >/dev/null 2>&1 \\
-                        && persistent_kr="\$(keyctl get_persistent @s 2>/dev/null)"; then
+                keyctl_available=0
+                command -v keyctl >/dev/null 2>&1 && keyctl_available=1
+
+                persistent_kr=""
+                if [ "\$cache_ttl" -gt 0 ] && [ "\$keyctl_available" -eq 1 ]; then
+                    # \`|| persistent_kr=""\` matters under \`set -e\`: this is
+                    # a bare assignment statement, not part of an \`if\`
+                    # condition, so an unguarded failing command
+                    # substitution here would kill the script immediately
+                    # instead of falling through to the recovery below.
+                    persistent_kr="\$(keyctl get_persistent @s 2>/dev/null)" || persistent_kr=""
+                    if [ -z "\$persistent_kr" ] && [ "\${OPENV_KEYRING_REEXEC:-0}" != 1 ]; then
+                        # @s (the session keyring) is unusable — almost
+                        # always because it was REVOKED. SSH's PAM stack
+                        # (pam_keyinit.so force revoke) revokes @s at logout
+                        # but never refreshes it for a process that outlives
+                        # that login (a detached tmux server reparented to
+                        # init, a long-lived daemon, sudo — which has no
+                        # pam_keyinit of its own and so only ever INHERITS
+                        # whatever @s it was handed). @s is still the right
+                        # destination (it's what children inherit, unlike @u
+                        # which loses "possessor" status across the setpriv
+                        # privilege drop above) — it just needs to be fresh.
+                        # \`keyctl session -\` joins a brand new anonymous
+                        # session keyring that this exec chain has never had
+                        # a chance to revoke, and it survives sudo/setpriv
+                        # the same way the original @s would have.
+                        #
+                        # Probe with a throwaway session first (create +
+                        # immediately destroy, foreground, NOT exec'd) so a
+                        # kernel.keys.maxkeys quota failure is caught HERE
+                        # rather than after committing: exec'ing straight
+                        # into a keyctl that then fails to even create the
+                        # session would replace this process with nothing,
+                        # and the user's real command would never run. There
+                        # is a narrow TOCTOU window between this probe and
+                        # the real attempt below under extreme concurrency;
+                        # accepted as a residual risk far better than the
+                        # alternative of an occasional outright failure to
+                        # launch.
+                        #
+                        # OPENV_KEYRING_REEXEC=1 is set by US, on this one
+                        # \`env\` call, on the same hop that reads it back
+                        # (stage 2 re-entering stage 2 directly — never
+                        # through stage 1's \`env -i\`, which is the only
+                        # thing in this wrapper that scrubs the environment).
+                        # Unlike a re-exec guard meant to survive a boundary
+                        # this script does NOT control, this one is entirely
+                        # self-administered, so it bounds the retry to
+                        # exactly one attempt by construction.
+                        if keyctl session - true >/dev/null 2>&1; then
+                            # Quiet by default: on a host where @s is
+                            # revoked by construction (a detached tmux
+                            # server, sudo with no pam_keyinit — see above),
+                            # this is the NORMAL path, not an anomaly, and
+                            # will fire on essentially every invocation. A
+                            # message that fires every time trains callers
+                            # to filter it out, and it corrupts any caller
+                            # that merges stdout+stderr expecting only the
+                            # wrapped command's own output (this repo's own
+                            # integration suite hit exactly that). The
+                            # recovery itself is silent; only a genuine
+                            # bypass (below, and the three other cache-path
+                            # anomalies) stays loud unconditionally.
+                            if [ "\${OP_ENV_WRAPPER_DEBUG:-0}" = 1 ]; then
+                                err "TTL cache: session keyring (@s) was unusable (commonly: revoked by a dead login session) — re-execing once under a fresh session keyring"
+                            fi
+                            exec env OPENV_KEYRING_REEXEC=1 keyctl session - "\$INSTALLED_WRAPPER" "\$@"
+                        else
+                            err "TTL cache bypassed: session keyring (@s) is unusable and a fresh one could not be created (kernel.keys.maxkeys quota exceeded, or keyctl is non-functional here) — falling back to the uncached path"
+                        fi
+                    elif [ -z "\$persistent_kr" ]; then
+                        err "TTL cache bypassed: session keyring (@s) is still unusable after one re-exec attempt — falling back to the uncached path"
+                    fi
+                elif [ "\$cache_ttl" -gt 0 ]; then
+                    err "TTL cache bypassed: keyctl not found on PATH (install keyutils to enable caching) — falling back to the uncached path"
+                fi
+
+                if [ -n "\$persistent_kr" ]; then
                     cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}"
 
                     # --- cache hit? ---
@@ -450,7 +536,7 @@ case "\$(uname -s)" in
                         done
                     fi
                     if [ "\${#assign[@]}" -gt 0 ]; then
-                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "\${assign[@]}" "\$@"
                     fi
 
                     # --- cache miss: resolve via an introspection target
@@ -481,9 +567,11 @@ case "\$(uname -s)" in
                         if [ "\${#injected[@]}" -gt 0 ]; then
                             if new_key_id="\$(printf '%s\0' "\${injected[@]}" | keyctl padd user "\$cache_desc" "\$persistent_kr" 2>/dev/null)"; then
                                 keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
+                            else
+                                err "TTL cache: failed to store the resolved Environment (commonly: kernel.keys.maxbytes/maxkeys quota exceeded on the persistent keyring) — this invocation still succeeds, but every call will keep resolving via op run (one more draw on the 1Password service account's SHARED DAILY quota) until the keyring quota is freed"
                             fi
                         fi
-                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "\${assign[@]}" "\$@"
                     fi
                     if [ "\$op_rc" -eq 9 ]; then
                         op_rate_limit_hint
@@ -509,7 +597,7 @@ case "\$(uname -s)" in
                 # under --no-masking — so we branch on the exit code alone.
                 rc=0
                 op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
-                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
+                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "\$@" || rc=\$?
                 if [ "\$rc" -eq 9 ]; then
                     op_rate_limit_hint
                 fi
@@ -554,7 +642,7 @@ case "\$(uname -s)" in
         rc=0
         env OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
             op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
-            env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
+            env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -u OPENV_KEYRING_REEXEC "\$@" || rc=\$?
         if [ "\$rc" -eq 9 ]; then
             op_rate_limit_hint
         fi
