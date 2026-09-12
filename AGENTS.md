@@ -181,42 +181,52 @@ with a dash:
 with-openbrain-env.sh -- ./some-tool --flag value
 ```
 
-### Advanced opt-ins (default-off): `OPENV_KEEP_PRIVILEGES`, `OPENV_PRESERVE_VARS`
+### Your environment reaches the wrapped command
 
-Two Linux opt-in env vars — no effect unless set — for admin tooling that must
-reach a root-only resource. Full contract in
-[`SPECIFICATION.md`](SPECIFICATION.md):
+Whatever you had set is what the command sees, plus the variables resolved from
+the 1Password Environment. You do not opt in and there is nothing to list:
 
-- **`OPENV_KEEP_PRIVILEGES=1`** — skip the default drop-to-invoker; run the child
-  at the current uid (root, when reached via `sudo`). Use only for a child that
-  genuinely needs a root-only resource (e.g. a `0750`-guarded unix socket); set
-  `HOME` is handled to match the kept uid so `op run` doesn't trip its
-  config-dir ownership check.
-- **`OPENV_PRESERVE_VARS="A,B"`** — carry the named caller-set vars through the
-  stage-1 `env -i` scrub into the child, instead of being stripped. This works on
-  a plain invocation: stage 0 forwards the allowlist and each variable it names
-  across its own `sudo` hop, so no external `sudo -E` is needed.
-  `OPENV_PRESERVE_VARS=SOME_VAR with-<id>-env.sh <command>`.
+```sh
+MY_VAR=hello with-<id>-env.sh some-command   # some-command sees MY_VAR=hello
+```
 
-**`OPENV_KEEP_PRIVILEGES` still requires an external `sudo -E`, deliberately.**
-Stage 0 refuses to forward it, because the installed sudoers fragment grants the
-IDENTIFIER group passwordless `sudo` for the wrapper; forwarding the flag would
-turn group membership into arbitrary root execution. Example:
-`OPENV_KEEP_PRIVILEGES=1 OPENV_PRESERVE_VARS=SOME_SECRET sudo -E with-<id>-env.sh <admin-command>`.
+Where a name is defined on both sides, **the 1Password value wins**.
 
-Both stages also refuse a name that is not a shell identifier, and the names the
-loader, bash, or the privileged stage itself rely on (`LD_*`, `BASH_*`, `PATH`,
-`IFS`, `SHELLOPTS`, `ENV`, `PS4`, `SHELL`, `HOME`, `TMPDIR`, `SUDO_*`,
-`WRAPPER_STAGE`, `OP_SERVICE_ACCOUNT_TOKEN`), plus the two `OPENV_*` control
-variables themselves. Naming one of those is silently a no-op rather than an
-error; the allowlist itself still crosses.
+How it works, because it is not obvious from the stage model. The wrapper
+escalates through `sudo`, whose `env_reset` destroys your environment, so
+stage 0 captures it first (`env -0`, into a private file on tmpfs) and forwards
+only that file's *path* across the boundary. The privileged stage never opens
+it. Stage 2 restores it after dropping back to you, then deletes it.
 
-Refusing at stage 0 alone would not be enough, because stage 0 forwards the
-allowlist itself. A name refused only there gets rebuilt at stage 1 out of the
-*privileged* stage's environment: `OPENV_PRESERVE_VARS=HOME` put root's home
-into a child running as the invoker until both sites shared one predicate.
+Root is needed for exactly one thing: decrypting the token out of the root-only
+credstore. That step reads nothing you set. And the command itself runs as YOU,
+so your own variables reaching your own child grant nothing you did not already
+have. That is why there is no allowlist and no denylist anywhere on this path.
 
-Both stay project-agnostic — the wrapper hard-codes nothing about any consumer.
+Three names do not come back, and none of them is yours:
+`OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` are the wrapper's internals (the
+first would leak the token into your command; the second would make a nested
+wrapper skip its stages), and the third is the pointer to the capture itself.
+
+**`OPENV_PRESERVE_VARS` is retired.** It was a comma-separated allowlist of
+names permitted through the old scrub. It is accepted and ignored, so a caller
+that still sets it is unaffected — every name it could have listed now crosses
+anyway.
+
+### `OPENV_KEEP_PRIVILEGES=1` — run the command as root (default-off)
+
+Skips the drop back to you, so the command runs at the current uid (root, when
+reached via `sudo`). Use it only for a child that genuinely needs a root-only
+resource, such as a `0750`-guarded unix socket. It takes effect only when the
+wrapper is invoked through an external `sudo -E`. In that branch `HOME` stays
+root's own, so `op run` accepts its config directory, and your `HOME` is the one
+variable the restore holds back.
+
+```sh
+OPENV_KEEP_PRIVILEGES=1 sudo -E with-<id>-env.sh <admin-command>
+```
+
+The wrapper stays project-agnostic — it hard-codes nothing about any consumer.
 
 ### TTL cache of the resolved environment: `OP_ENV_WRAPPER_CACHE_TTL`
 

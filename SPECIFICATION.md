@@ -111,13 +111,15 @@ The Linux path is a 3-stage `WRAPPER_STAGE` re-exec:
    `/etc/credstore.encrypted/1password-env-wrapper-<IDENTIFIER>`
    into a memory variable, then `setpriv --reuid=$SUDO_UID
    --regid=$SUDO_GID --init-groups` re-exec the wrapper as the
-   *invoker* with the token in env (`WRAPPER_STAGE=2`). Two
-   default-off, caller-supplied opt-ins MAY adjust this hop:
+   *invoker* with the token in env (`WRAPPER_STAGE=2`). Decrypting
+   the token is the ONLY thing this stage needs root for, and it reads
+   nothing the caller set: its inputs are the wrapper's baked-in
+   constants and the `SUDO_*` values sudo itself supplies. One
+   default-off, caller-supplied opt-in MAY adjust this hop:
    `OPENV_KEEP_PRIVILEGES=1` skips the `setpriv` drop (the command
-   runs at the current uid, i.e. root), and `OPENV_PRESERVE_VARS`
-   carries named variables through the `env -i` scrub. Both are
-   detailed in [Architecture Principles §5](#architecture-principles)
-   and "Runtime Behavior" below.
+   runs at the current uid, i.e. root). It is detailed in
+   [Architecture Principles §5](#architecture-principles) and
+   "Runtime Behavior" below.
 3. **Stage 2 — run.** As the invoker (or as root when
    `OPENV_KEEP_PRIVILEGES=1`), `op run --environment
    <ONEPASSWORD_ENVIRONMENT_ID> -- env -u
@@ -157,10 +159,11 @@ and no privilege drop**:
    re-runs its own stages). The inner `env -u …` uses no GNU `--`
    separator, so a POSIX/uutils `env` accepts it; op's own `--` is
    retained. The
-   `OPENV_KEEP_PRIVILEGES` and `OPENV_PRESERVE_VARS` opt-ins are
-   inert on macOS: there is no privilege escalation to keep and no
-   `env -i` scrub to carry variables through (caller variables
-   already reach the child).
+   `OPENV_KEEP_PRIVILEGES` opt-in is inert on macOS: there is no
+   privilege escalation to keep. Caller variables reach the child on
+   both platforms — on macOS because nothing ever scrubs them, and on
+   Linux because the caller's environment is captured before the
+   escalation and restored after the privilege drop.
 
 Rationale for the asymmetry: single-user macOS dev machines do not
 have a separate IDENTIFIER user that needs isolating from the
@@ -354,61 +357,50 @@ All shell scripts in this repository SHALL:
        `HOME` set to the invoker's home, since the child runs as the
        invoker there. macOS performs no escalation or drop, so this
        opt-in is inert there.
-     - **`OPENV_PRESERVE_VARS`** — a comma-separated allowlist of
-       environment-variable NAMES whose current values SHALL be
-       carried THROUGH the Stage-1 `env -i` scrub into the final
-       command. The wrapper trims surrounding whitespace from each
-       name, skips empty entries, and for each surviving name appends
-       `NAME=<current value>` to the scrubbed environment. When unset
-       or empty, nothing extra is preserved. This is the generic,
-       caller-controlled mechanism for forwarding a named secret or
-       setting across the scrub; the wrapper never hard-codes any
-       specific variable name. Only the caller decides which names
-       cross the boundary. macOS performs no `env -i` scrub, so
-       caller-supplied variables already pass through to the final
-       command; this opt-in is therefore inert there.
+     - **The caller's environment SHALL survive the escalation.**
+       sudo's `env_reset` destroys it at the Stage 0 hop, and the
+       Stage-1 `env -i` would destroy it again. Neither scrub protects
+       anything: the command runs as the INVOKER, so a variable the
+       caller set reaching the caller's own child conveys no privilege
+       the caller did not already hold, and the one privileged step
+       (decrypting the token) reads no caller variable at all.
 
-       On Linux this allowlist is read at Stage 1, which sudo's
-       `env_reset` is reached only after. Stage 0 SHALL therefore
-       forward `OPENV_PRESERVE_VARS` itself, and a `NAME=<current
-       value>` operand for each name it lists, on the escalating
-       `sudo` command line, by the same technique already used for
-       `OP_ENV_WRAPPER_CACHE_TTL`. Without that forwarding the
-       allowlist and every variable it names are destroyed before the
-       code that reads them runs, so the mechanism does nothing on a
-       plain invocation and works only when the caller has separately
-       wrapped the whole call in an external `sudo -E`.
+       Stage 0 SHALL therefore capture its own environment, as the
+       caller, NUL-delimited (`env -0`, the only lossless framing,
+       since a value may contain newlines but never a NUL byte) into a
+       file readable only by the caller, preferring a tmpfs runtime
+       directory so the capture does not reach disk. It SHALL forward
+       only that file's PATH across the sudo boundary, under one fixed
+       name. The privileged stage SHALL NOT open the file.
 
-       **Both** the Stage-0 forward build and the Stage-1 preserve
-       build SHALL refuse a name that is not a shell identifier
-       (`[A-Za-z_][A-Za-z0-9_]*`), the names that the dynamic loader
-       or bash honour before the privileged stage runs (`LD_*`,
-       `BASH_*`, `GLIBC_*`, `PYTHON*`, `PERL5*`, `ENV`, `BASHOPTS`,
-       `SHELLOPTS`, `PS4`, `IFS`, `PATH`, `SHELL`, `HOME`, `TMPDIR`),
-       the names the privileged stage itself relies on (`SUDO_*`,
-       `WRAPPER_STAGE`, `OP_SERVICE_ACCOUNT_TOKEN`), and the two
-       control variables (`OPENV_PRESERVE_VARS`,
-       `OPENV_KEEP_PRIVILEGES`). The refusal SHALL be one shared
-       predicate so the two sites cannot drift. The escalation
-       boundary stays deliberate: a caller who can name a variable
-       SHALL NOT thereby be able to steer the root stage.
+       Stage 2, once privileges are back down to the invoker, SHALL
+       restore every variable from that capture and then delete the
+       file. There SHALL be no allowlist and no denylist of variable
+       names: the root stage receives a path, never caller-chosen
+       names, which is a stronger boundary than any list of names to
+       refuse and needs no maintenance.
 
-       Refusing at Stage 0 alone is NOT sufficient, because Stage 0
-       forwards the allowlist itself unconditionally. A name refused
-       only there is still rebuilt at Stage 1 out of the PRIVILEGED
-       stage's environment rather than the caller's — measured before
-       this was closed, `OPENV_PRESERVE_VARS=HOME` placed root's home
-       directory into a child running as the invoker, and
-       `OPENV_PRESERVE_VARS=LD_PRELOAD` spliced an empty `LD_PRELOAD`
-       into the child's environment.
+       Exactly three names SHALL be skipped, and none is the caller's.
+       `OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` are this
+       wrapper's own internals: re-exporting the first would leak the
+       token into the child, and the second would make a nested
+       wrapper skip its stages. The third is the pointer to the
+       capture. `HOME` SHALL additionally be held back under
+       `OPENV_KEEP_PRIVILEGES`, where the child stays root and Stage 1
+       deliberately set `HOME` to root's own home so `op run` accepts
+       its config directory; that is an `op` ownership constraint, not
+       a privilege boundary.
 
-       `OPENV_KEEP_PRIVILEGES` is refused for a sharper reason and
-       SHALL remain so. The sudoers fragment of Architecture
-       Principles §6 grants the `IDENTIFIER` group passwordless `sudo`
-       for this wrapper, so forwarding that flag across this hop would
-       turn group membership into arbitrary root execution. It keeps
-       requiring an external `sudo -E`, where the caller has already
-       demonstrated the privilege.
+       The restore SHALL happen BEFORE the Environment is resolved, so
+       the caller's environment is the baseline the resolved
+       Environment is diffed against and a name defined on both sides
+       resolves to the 1Password value, per the override rule below.
+
+       `OPENV_PRESERVE_VARS`, a former comma-separated allowlist of
+       names permitted through the Stage-1 scrub, is RETIRED. It is
+       accepted and ignored, so an existing caller that still sets it
+       is unaffected: every name it could have listed now crosses
+       anyway.
    - On **macOS**, the secure store is the per-user **login
      Keychain**, stored as a generic password under service name
      `<IDENTIFIER>` and account name `OP_SERVICE_ACCOUNT_TOKEN`,
@@ -719,8 +711,11 @@ covers all three:
    (`env -i`) carrying only `HOME` (the invoker's home), `PATH`
    (a deterministic safe value: `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`),
    `OP_SERVICE_ACCOUNT_TOKEN` (the just-decrypted token), and
-   `WRAPPER_STAGE=2`. The token never appears on a command line
-   and never touches disk after decryption. The `env -i`
+   `WRAPPER_STAGE=2`, plus the caller-environment capture's PATH.
+   The token never appears on a command line and never touches disk
+   after decryption. This `env -i` exists to keep sudo's own
+   artifacts and root's `HOME` out of the child, NOT to withhold the
+   caller's variables: Stage 2 restores those in full. The `env -i`
    invocation SHALL NOT use a GNU-style `--` separator after its
    `NAME=value` operands: a POSIX-conformant `env` (including the
    uutils coreutils `env`) ends its assignment list at the first
@@ -733,10 +728,9 @@ covers all three:
    in that branch SHALL set `HOME` to the current uid's home
    (`getent passwd "$(id -u)"`, falling back to `/root`) rather than
    the invoker's, so `op run`'s config-directory ownership check is
-   satisfied for the root child; and for each name in
-   `OPENV_PRESERVE_VARS` it SHALL splice an extra `NAME=<current
-   value>` operand into the `env -i` argument list so that named
-   value survives the scrub.
+   satisfied for the root child. Stage 1 SHALL carry the caller
+   environment capture's PATH through to Stage 2 without opening the
+   file.
 3. **Stage 2 — run.** Running as the invoker (or as `root` when
    `OPENV_KEEP_PRIVILEGES=1` was set) with the token in env, the
    wrapper SHALL:
@@ -980,12 +974,13 @@ entirely.
   final child process environment, so a wrapper invoked from inside
   another wrapped command re-runs its own stages rather than
   inheriting a stale stage.
-- When `OPENV_PRESERVE_VARS` names a variable, that variable's
-  value as seen by the wrapper at Stage 1 SHALL be present in the
-  final child process environment unless the 1Password Environment
-  also defines a variable of the same name (in which case the
-  1Password value wins, per the override rule above). `OPENV_*`
-  control variables themselves are not injected into the child.
+- Every variable the CALLER had set SHALL be present in the final
+  child process environment, with the value the caller had, unless
+  the 1Password Environment also defines that name (in which case
+  the 1Password value wins, per the override rule above). This is
+  not an opt-in and needs no allowlist: the child runs at the
+  caller's own privilege. `OPENV_*` control variables themselves are
+  not injected into the child.
 - `OP_ENV_WRAPPER_CACHE_TTL` (see "TTL cache of the op-resolved
   environment" above) is likewise a wrapper control variable: whether
   a given variable reached the child from a live `op run` resolution
