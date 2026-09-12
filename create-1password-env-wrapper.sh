@@ -262,7 +262,46 @@ case "\$(uname -s)" in
                 # \${VAR:-} degrades a genuinely-unset caller value to an
                 # empty string, which stage 2's \${...:-300} default treats
                 # the same as unset.
-                exec "\$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" -- "\$INSTALLED_WRAPPER" "\$@"
+                # The same env_reset also destroys OPENV_PRESERVE_VARS and
+                # every variable it names, and stage 1 — the only place that
+                # reads the allowlist — therefore saw nothing. So the
+                # documented forwarding mechanism could not work through the
+                # wrapper's own sudo hop at all, and callers were told to
+                # wrap the whole invocation in an external \`sudo -E\`
+                # instead. Forward the allowlist and its named variables here
+                # so a plain invocation carries them.
+                #
+                # The escalation boundary stays deliberate rather than
+                # caller-controlled. A forwarded name must look like a shell
+                # identifier, and a name that the privileged stage relies on,
+                # or that the dynamic loader or bash honour before any of
+                # this code runs, is refused. OPENV_KEEP_PRIVILEGES is
+                # refused for a sharper reason: the installed sudoers
+                # fragment grants the IDENTIFIER group passwordless sudo for
+                # this wrapper, so forwarding that flag would turn group
+                # membership into arbitrary root execution. It keeps
+                # requiring an external \`sudo -E\`, where the caller has
+                # already proven the privilege.
+                forward=()
+                if [ -n "\${OPENV_PRESERVE_VARS:-}" ]; then
+                    forward+=( "OPENV_PRESERVE_VARS=\$OPENV_PRESERVE_VARS" )
+                    IFS=',' read -r -a _fwd_names <<< "\$OPENV_PRESERVE_VARS"
+                    for _fwd_n in "\${_fwd_names[@]}"; do
+                        # Trim leading/trailing whitespace.
+                        _fwd_n="\${_fwd_n#"\${_fwd_n%%[![:space:]]*}"}"
+                        _fwd_n="\${_fwd_n%"\${_fwd_n##*[![:space:]]}"}"
+                        [ -n "\$_fwd_n" ] || continue
+                        case "\$_fwd_n" in
+                            [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;;
+                            LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) continue ;;
+                            ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) continue ;;
+                            SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) continue ;;
+                            OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) continue ;;
+                        esac
+                        forward+=( "\$_fwd_n=\$(printenv "\$_fwd_n" 2>/dev/null || true)" )
+                    done
+                fi
+                exec "\$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" "\${forward[@]}" -- "\$INSTALLED_WRAPPER" "\$@"
                 ;;
             1)
                 # Stage 1 — running as root. Decrypt the credential into memory,
