@@ -379,17 +379,28 @@ All shell scripts in this repository SHALL:
        plain invocation and works only when the caller has separately
        wrapped the whole call in an external `sudo -E`.
 
-       Stage 0 SHALL refuse to forward a name that is not a shell
-       identifier (`[A-Za-z_][A-Za-z0-9_]*`), and SHALL refuse the
-       names that the dynamic loader or bash honour before the
-       privileged stage runs (`LD_*`, `BASH_*`, `GLIBC_*`, `PYTHON*`,
-       `PERL5*`, `ENV`, `BASHOPTS`, `SHELLOPTS`, `PS4`, `IFS`, `PATH`,
-       `SHELL`, `HOME`, `TMPDIR`), the names the privileged stage
-       itself relies on (`SUDO_*`, `WRAPPER_STAGE`,
-       `OP_SERVICE_ACCOUNT_TOKEN`), and the two control variables
-       (`OPENV_PRESERVE_VARS`, `OPENV_KEEP_PRIVILEGES`). The
-       escalation boundary stays deliberate: a caller who can name a
-       variable SHALL NOT thereby be able to steer the root stage.
+       **Both** the Stage-0 forward build and the Stage-1 preserve
+       build SHALL refuse a name that is not a shell identifier
+       (`[A-Za-z_][A-Za-z0-9_]*`), the names that the dynamic loader
+       or bash honour before the privileged stage runs (`LD_*`,
+       `BASH_*`, `GLIBC_*`, `PYTHON*`, `PERL5*`, `ENV`, `BASHOPTS`,
+       `SHELLOPTS`, `PS4`, `IFS`, `PATH`, `SHELL`, `HOME`, `TMPDIR`),
+       the names the privileged stage itself relies on (`SUDO_*`,
+       `WRAPPER_STAGE`, `OP_SERVICE_ACCOUNT_TOKEN`), and the two
+       control variables (`OPENV_PRESERVE_VARS`,
+       `OPENV_KEEP_PRIVILEGES`). The refusal SHALL be one shared
+       predicate so the two sites cannot drift. The escalation
+       boundary stays deliberate: a caller who can name a variable
+       SHALL NOT thereby be able to steer the root stage.
+
+       Refusing at Stage 0 alone is NOT sufficient, because Stage 0
+       forwards the allowlist itself unconditionally. A name refused
+       only there is still rebuilt at Stage 1 out of the PRIVILEGED
+       stage's environment rather than the caller's — measured before
+       this was closed, `OPENV_PRESERVE_VARS=HOME` placed root's home
+       directory into a child running as the invoker, and
+       `OPENV_PRESERVE_VARS=LD_PRELOAD` spliced an empty `LD_PRELOAD`
+       into the child's environment.
 
        `OPENV_KEEP_PRIVILEGES` is refused for a sharper reason and
        SHALL remain so. The sudoers fragment of Architecture

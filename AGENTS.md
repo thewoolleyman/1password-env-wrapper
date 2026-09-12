@@ -204,11 +204,17 @@ IDENTIFIER group passwordless `sudo` for the wrapper; forwarding the flag would
 turn group membership into arbitrary root execution. Example:
 `OPENV_KEEP_PRIVILEGES=1 OPENV_PRESERVE_VARS=SOME_SECRET sudo -E with-<id>-env.sh <admin-command>`.
 
-Stage 0 also refuses to forward a name that is not a shell identifier, and the
-names the loader, bash, or the privileged stage itself rely on (`LD_*`, `BASH_*`,
-`PATH`, `IFS`, `SHELLOPTS`, `ENV`, `PS4`, `SHELL`, `HOME`, `TMPDIR`, `SUDO_*`,
-`WRAPPER_STAGE`, `OP_SERVICE_ACCOUNT_TOKEN`). Naming one of those is silently a
-no-op rather than an error; the allowlist itself still crosses.
+Both stages also refuse a name that is not a shell identifier, and the names the
+loader, bash, or the privileged stage itself rely on (`LD_*`, `BASH_*`, `PATH`,
+`IFS`, `SHELLOPTS`, `ENV`, `PS4`, `SHELL`, `HOME`, `TMPDIR`, `SUDO_*`,
+`WRAPPER_STAGE`, `OP_SERVICE_ACCOUNT_TOKEN`), plus the two `OPENV_*` control
+variables themselves. Naming one of those is silently a no-op rather than an
+error; the allowlist itself still crosses.
+
+Refusing at stage 0 alone would not be enough, because stage 0 forwards the
+allowlist itself. A name refused only there gets rebuilt at stage 1 out of the
+*privileged* stage's environment: `OPENV_PRESERVE_VARS=HOME` put root's home
+into a child running as the invoker until both sites shared one predicate.
 
 Both stay project-agnostic — the wrapper hard-codes nothing about any consumer.
 
