@@ -210,37 +210,6 @@ die()  { err "\$@"; exit 1; }
 # in exactly one place.
 op_rate_limit_hint() { err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait, or cut op-run frequency. See https://www.1password.dev/service-accounts/rate-limits/"; }
 
-# Names that SHALL NOT cross via OPENV_PRESERVE_VARS. Shared by the stage-0
-# forward build and the stage-1 preserve build so the two cannot drift.
-#
-# Refusing at BOTH sites is what makes the refusal real. Stage 0 forwards the
-# ALLOWLIST ITSELF unconditionally, so a name refused only at stage 0 is still
-# rebuilt at stage 1 out of the PRIVILEGED stage's environment rather than the
-# caller's. That is not theoretical: OPENV_PRESERVE_VARS=HOME put root's home
-# into a child running as the invoker, and OPENV_PRESERVE_VARS=LD_PRELOAD
-# spliced an empty LD_PRELOAD into the child's environment.
-#
-# A name must look like a shell identifier. The dynamic loader's and bash's own
-# control names are refused because they are honoured before any of this code
-# runs. The names the privileged stage relies on are refused. The two OPENV_*
-# control variables are refused so a caller cannot re-inject them into the
-# child, which SPECIFICATION.md already requires.
-#
-# The closing brace below is INDENTED deliberately. test/wrapper-render.bats
-# extracts this template by reading to the first lone closing brace at column
-# zero, so a column-zero brace here truncates the rendered sample and every
-# render test fails in setup_file. Bash accepts an indented terminator.
-openv_name_refused() {
-    case "\$1" in
-        [!A-Za-z_]*|*[!A-Za-z0-9_]*) return 0 ;;
-        LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) return 0 ;;
-        ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) return 0 ;;
-        SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) return 0 ;;
-        OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) return 0 ;;
-    esac
-    return 1
-    }
-
 # Drop -- separator if present.
 if [ "\$#" -gt 0 ] && [ "\$1" = "--" ]; then
     shift
@@ -293,40 +262,47 @@ case "\$(uname -s)" in
                 # \${VAR:-} degrades a genuinely-unset caller value to an
                 # empty string, which stage 2's \${...:-300} default treats
                 # the same as unset.
-                # The same env_reset also destroys OPENV_PRESERVE_VARS and
-                # every variable it names, and stage 1 — the only place that
-                # reads the allowlist — therefore saw nothing. So the
-                # documented forwarding mechanism could not work through the
-                # wrapper's own sudo hop at all, and callers were told to
-                # wrap the whole invocation in an external \`sudo -E\`
-                # instead. Forward the allowlist and its named variables here
-                # so a plain invocation carries them.
+                # The same env_reset also destroys the CALLER'S OWN
+                # environment, and that is the scrub that actually hurts.
                 #
-                # The escalation boundary stays deliberate rather than
-                # caller-controlled. A forwarded name must look like a shell
-                # identifier, and a name that the privileged stage relies on,
-                # or that the dynamic loader or bash honour before any of
-                # this code runs, is refused. OPENV_KEEP_PRIVILEGES is
-                # refused for a sharper reason: the installed sudoers
-                # fragment grants the IDENTIFIER group passwordless sudo for
-                # this wrapper, so forwarding that flag would turn group
-                # membership into arbitrary root execution. It keeps
-                # requiring an external \`sudo -E\`, where the caller has
-                # already proven the privilege.
-                forward=()
-                if [ -n "\${OPENV_PRESERVE_VARS:-}" ]; then
-                    forward+=( "OPENV_PRESERVE_VARS=\$OPENV_PRESERVE_VARS" )
-                    IFS=',' read -r -a _fwd_names <<< "\$OPENV_PRESERVE_VARS"
-                    for _fwd_n in "\${_fwd_names[@]}"; do
-                        # Trim leading/trailing whitespace.
-                        _fwd_n="\${_fwd_n#"\${_fwd_n%%[![:space:]]*}"}"
-                        _fwd_n="\${_fwd_n%"\${_fwd_n##*[![:space:]]}"}"
-                        [ -n "\$_fwd_n" ] || continue
-                        if openv_name_refused "\$_fwd_n"; then continue; fi
-                        forward+=( "\$_fwd_n=\$(printenv "\$_fwd_n" 2>/dev/null || true)" )
-                    done
+                # Root is needed for exactly one thing: decrypting the token
+                # out of the root-only credstore. That step reads nothing from
+                # the caller — its inputs are this wrapper's baked-in constants
+                # and the SUDO_* values sudo sets itself. So no caller variable
+                # needs to reach root, and there is nothing here to allowlist,
+                # denylist, or sanitize.
+                #
+                # The final command runs as the INVOKER, so a variable the
+                # caller set reaching the caller's own child grants no
+                # privilege they did not already have. Losing it buys nothing
+                # and costs silence: the child simply behaves as if the caller
+                # never set it.
+                #
+                # So: capture the caller's environment HERE, as the caller,
+                # losslessly, into a file only the caller can read, and forward
+                # just its PATH across the sudo boundary under one fixed name.
+                # Root receives a path and never reads the file. Stage 2
+                # restores it after dropping back to the invoker.
+                #
+                # Prefer the per-user runtime directory (tmpfs, 0700) so the
+                # capture never reaches disk; fall back to mktemp's default.
+                caller_env_file=""
+                if [ -n "\${XDG_RUNTIME_DIR:-}" ] && [ -d "\$XDG_RUNTIME_DIR" ] && [ -w "\$XDG_RUNTIME_DIR" ]; then
+                    caller_env_file="\$(mktemp "\$XDG_RUNTIME_DIR/openv-callerenv.XXXXXXXX" 2>/dev/null || true)"
                 fi
-                exec "\$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" "\${forward[@]}" -- "\$INSTALLED_WRAPPER" "\$@"
+                if [ -z "\$caller_env_file" ]; then
+                    caller_env_file="\$(mktemp 2>/dev/null || true)"
+                fi
+                if [ -n "\$caller_env_file" ]; then
+                    chmod 600 "\$caller_env_file" 2>/dev/null || true
+                    # env -0 is the only lossless framing: an environment value
+                    # may contain newlines (a PEM key), never a NUL byte.
+                    if ! env -0 > "\$caller_env_file" 2>/dev/null; then
+                        rm -f "\$caller_env_file" 2>/dev/null || true
+                        caller_env_file=""
+                    fi
+                fi
+                exec "\$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" OPENV_CALLER_ENV_FILE="\$caller_env_file" -- "\$INSTALLED_WRAPPER" "\$@"
                 ;;
             1)
                 # Stage 1 — running as root. Decrypt the credential into memory,
@@ -354,26 +330,11 @@ case "\$(uname -s)" in
                 fi
                 [ -n "\$token" ] || die "decrypted credential is empty"
 
-                # OPENV_PRESERVE_VARS (default unset/empty) — generic,
-                # caller-controlled allowlist of env var NAMES whose current
-                # values are carried THROUGH the \`env -i\` scrub into the final
-                # command. This is the generic mechanism for forwarding a
-                # named secret/setting; the wrapper hard-codes no specific name.
-                # Names are read from the runtime env, comma-separated;
-                # whitespace is trimmed and empty entries are skipped.
-                preserve=()
-                if [ -n "\${OPENV_PRESERVE_VARS:-}" ]; then
-                    IFS=',' read -r -a _openv_names <<< "\$OPENV_PRESERVE_VARS"
-                    for _openv_n in "\${_openv_names[@]}"; do
-                        # Trim leading/trailing whitespace.
-                        _openv_n="\${_openv_n#"\${_openv_n%%[![:space:]]*}"}"
-                        _openv_n="\${_openv_n%"\${_openv_n##*[![:space:]]}"}"
-                        [ -n "\$_openv_n" ] || continue
-                        if openv_name_refused "\$_openv_n"; then continue; fi
-                        preserve+=( "\$_openv_n=\$(printenv "\$_openv_n" 2>/dev/null || true)" )
-                    done
-                fi
-
+                # Root's one job is done: the token is decrypted. Nothing
+                # below reads a caller-chosen variable, and the caller's own
+                # environment is carried past this stage as an opaque file the
+                # root stage never opens (OPENV_CALLER_ENV_FILE). Stage 2
+                # restores it once privileges are back down.
                 if [ "\${OPENV_KEEP_PRIVILEGES:-0}" = "1" ]; then
                     # OPENV_KEEP_PRIVILEGES=1 — explicit, default-off opt-OUT of
                     # the drop-to-invoker principle (SPECIFICATION.md
@@ -397,7 +358,7 @@ case "\$(uname -s)" in
                         OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
                         WRAPPER_STAGE=2 \\
                         OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" \\
-                        "\${preserve[@]}" \\
+                        OPENV_CALLER_ENV_FILE="\${OPENV_CALLER_ENV_FILE:-}" \\
                         "\$INSTALLED_WRAPPER" "\$@"
                 else
                     # Default: drop privileges back to the *invoker* via setpriv.
@@ -409,7 +370,7 @@ case "\$(uname -s)" in
                         OP_SERVICE_ACCOUNT_TOKEN="\$token" \\
                         WRAPPER_STAGE=2 \\
                         OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" \\
-                        "\${preserve[@]}" \\
+                        OPENV_CALLER_ENV_FILE="\${OPENV_CALLER_ENV_FILE:-}" \\
                         setpriv --reuid="\$SUDO_UID" --regid="\$SUDO_GID" --init-groups -- \\
                         "\$INSTALLED_WRAPPER" "\$@"
                 fi
@@ -421,6 +382,52 @@ case "\$(uname -s)" in
                 # op item get, op read, or any other vault-touching op
                 # subcommand — only op run --environment.
                 [ -n "\${OP_SERVICE_ACCOUNT_TOKEN:-}" ] || die "stage 2 requires OP_SERVICE_ACCOUNT_TOKEN in env"
+
+                # Restore the caller's environment, captured at stage 0 before
+                # sudo's env_reset destroyed it. Privileges are already back
+                # down to the invoker here, so these values carry exactly the
+                # privilege the caller always had. Everything is restored:
+                # there is no allowlist, because there is nothing for one to
+                # protect.
+                #
+                # Restored BEFORE the op resolve below, so the 1Password
+                # Environment is diffed against an environment that already
+                # includes the caller's. A name defined on both sides therefore
+                # resolves to the 1PASSWORD value, which is the documented
+                # precedence.
+                #
+                # Three names are skipped, and none of them is the caller's:
+                # the decrypted token and the stage sentinel are this wrapper's
+                # own internals, and re-exporting either would leak the token
+                # or make a nested wrapper skip its stages. The third is the
+                # pointer to the capture itself.
+                #
+                # HOME is skipped ONLY under OPENV_KEEP_PRIVILEGES, where the
+                # child stays root and stage 1 deliberately set HOME to root's
+                # own home so `op run` accepts its config directory. That is an
+                # op ownership constraint, not a privilege boundary.
+                if [ -n "\${OPENV_CALLER_ENV_FILE:-}" ]; then
+                    if [ -r "\$OPENV_CALLER_ENV_FILE" ]; then
+                        while IFS= read -r -d "" _restore_kv; do
+                            case "\$_restore_kv" in
+                                *=*) ;;
+                                *) continue ;;
+                            esac
+                            _restore_n="\${_restore_kv%%=*}"
+                            [ -n "\$_restore_n" ] || continue
+                            case "\$_restore_n" in
+                                WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN|OPENV_CALLER_ENV_FILE) continue ;;
+                            esac
+                            if [ "\${OPENV_KEEP_PRIVILEGES:-0}" = "1" ] && [ "\$_restore_n" = "HOME" ]; then
+                                continue
+                            fi
+                            export "\$_restore_n=\${_restore_kv#*=}"
+                        done < "\$OPENV_CALLER_ENV_FILE"
+                    fi
+                    rm -f "\$OPENV_CALLER_ENV_FILE" 2>/dev/null || true
+                    unset OPENV_CALLER_ENV_FILE
+                fi
+
                 unset OP_CONNECT_HOST OP_CONNECT_TOKEN
                 # OP_CACHE=false (original hardening default, kept). op's cache
                 # does NOT cover \`op run --environment\` resolution — verified by
