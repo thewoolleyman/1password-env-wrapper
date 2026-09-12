@@ -103,6 +103,31 @@ build_preserve() {
     fi
 }
 
+# Mirror of the rendered stage-0 forward build, which decides what crosses
+# the sudo boundary into the privileged stage. Kept byte-comparable with the
+# template so a change to one without the other fails the structural tests
+# above.
+build_forward() {
+    forward=()
+    if [ -n "${OPENV_PRESERVE_VARS:-}" ]; then
+        forward+=( "OPENV_PRESERVE_VARS=$OPENV_PRESERVE_VARS" )
+        IFS=',' read -r -a _fwd_names <<< "$OPENV_PRESERVE_VARS"
+        for _fwd_n in "${_fwd_names[@]}"; do
+            _fwd_n="${_fwd_n#"${_fwd_n%%[![:space:]]*}"}"
+            _fwd_n="${_fwd_n%"${_fwd_n##*[![:space:]]}"}"
+            [ -n "$_fwd_n" ] || continue
+            case "$_fwd_n" in
+                [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;;
+                LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) continue ;;
+                ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) continue ;;
+                SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) continue ;;
+                OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) continue ;;
+            esac
+            forward+=( "$_fwd_n=$(printenv "$_fwd_n" 2>/dev/null || true)" )
+        done
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # Rendered-bytes structural tests.
 # ---------------------------------------------------------------------------
@@ -136,8 +161,10 @@ build_preserve() {
 }
 
 @test "sudo self-escalation keeps its own -- separator" {
-    # sudo supports `--`; it must stay.
-    grep -Fq '"$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="${OP_ENV_WRAPPER_CACHE_TTL:-}" -- "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
+    # sudo supports `--`; it must stay. The stage-0 forward splice sits
+    # between the TTL assignment and that separator, so the assertion is on
+    # the whole hop rather than on one frozen substring.
+    grep -Fq '"$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="${OP_ENV_WRAPPER_CACHE_TTL:-}" "${forward[@]}" -- "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
 }
 
 @test "OP_ENV_WRAPPER_CACHE_TTL is threaded through the sudo hop and both stage-1 env -i re-execs" {
@@ -321,6 +348,90 @@ default_drop_branch() {
     OPENV_PRESERVE_VARS='OPENV_DOES_NOT_EXIST' build_preserve
     [ "${#preserve[@]}" -eq 1 ]
     [ "${preserve[0]}" = "OPENV_DOES_NOT_EXIST=" ]
+}
+
+# ---------------------------------------------------------------------------
+# Stage-0 forwarding of the OPENV_PRESERVE_VARS allowlist across the sudo hop.
+#
+# sudo's env_reset destroys the caller's ambient environment at stage 0, and
+# stage 1 is the only place that reads OPENV_PRESERVE_VARS. Before this
+# forwarding existed, both the allowlist and every variable it named were
+# already gone by the time anything looked at them, so the documented
+# mechanism silently did nothing through a plain invocation. What crosses the
+# boundary is deliberate: the privileged stage must not be steerable by a
+# caller who can only name variables.
+# ---------------------------------------------------------------------------
+
+@test "stage-0 builds a forward array and splices it into the sudo hop" {
+    grep -Fq 'forward=()' "$RENDERED"
+    grep -Fq 'forward+=( "OPENV_PRESERVE_VARS=$OPENV_PRESERVE_VARS" )' "$RENDERED"
+    run grep -cF '"${forward[@]}"' "$RENDERED"
+    [ "$output" -eq 1 ]
+}
+
+@test "forward build: unset OPENV_PRESERVE_VARS yields an empty array, safe under set -u" {
+    set -u
+    unset OPENV_PRESERVE_VARS || true
+    build_forward
+    [ "${#forward[@]}" -eq 0 ]
+    run env -i HOME=/x "${forward[@]}" printenv HOME
+    assert_success_local "$status" "/x" "$output"
+}
+
+@test "forward build: the allowlist crosses first, then each variable it names" {
+    export OPENV_FWD_ONE='one' OPENV_FWD_TWO='two'
+    OPENV_PRESERVE_VARS='OPENV_FWD_ONE,OPENV_FWD_TWO' build_forward
+    [ "${#forward[@]}" -eq 3 ]
+    [ "${forward[0]}" = "OPENV_PRESERVE_VARS=OPENV_FWD_ONE,OPENV_FWD_TWO" ]
+    [ "${forward[1]}" = "OPENV_FWD_ONE=one" ]
+    [ "${forward[2]}" = "OPENV_FWD_TWO=two" ]
+    unset OPENV_FWD_ONE OPENV_FWD_TWO
+}
+
+@test "forward build: a caller-set variable outside the allowlist does not cross" {
+    export OPENV_NAMED='named' OPENV_UNNAMED='unnamed'
+    OPENV_PRESERVE_VARS='OPENV_NAMED' build_forward
+    [ "${#forward[@]}" -eq 2 ]
+    run printf '%s\n' "${forward[@]}"
+    [[ "$output" != *OPENV_UNNAMED* ]]
+    unset OPENV_NAMED OPENV_UNNAMED
+}
+
+@test "forward build: loader and shell names are refused so the root stage cannot be steered" {
+    export LD_PRELOAD='/tmp/evil.so' BASH_ENV='/tmp/evil.sh' PATH_KEEP="$PATH"
+    OPENV_PRESERVE_VARS='LD_PRELOAD,BASH_ENV,PATH,IFS,SHELLOPTS,ENV,PS4' build_forward
+    # Only the allowlist itself crosses; every named entry is refused.
+    [ "${#forward[@]}" -eq 1 ]
+    [ "${forward[0]}" = "OPENV_PRESERVE_VARS=LD_PRELOAD,BASH_ENV,PATH,IFS,SHELLOPTS,ENV,PS4" ]
+    unset LD_PRELOAD BASH_ENV PATH_KEEP
+}
+
+@test "forward build: OPENV_KEEP_PRIVILEGES is refused so group membership cannot become root" {
+    # The installed sudoers fragment grants the IDENTIFIER group passwordless
+    # sudo for this wrapper. Forwarding the keep-privileges flag through that
+    # hop would let any group member run an arbitrary command as root, so the
+    # flag keeps requiring an external `sudo -E` the caller had to earn.
+    export OPENV_KEEP_PRIVILEGES='1'
+    OPENV_PRESERVE_VARS='OPENV_KEEP_PRIVILEGES' build_forward
+    [ "${#forward[@]}" -eq 1 ]
+    run printf '%s\n' "${forward[@]}"
+    [[ "$output" != *"OPENV_KEEP_PRIVILEGES=1"* ]]
+    unset OPENV_KEEP_PRIVILEGES
+}
+
+@test "forward build: a name that is not a shell identifier is refused" {
+    OPENV_PRESERVE_VARS='9LEADING,has-dash,has.dot,ok_name' build_forward
+    [ "${#forward[@]}" -eq 2 ]
+    [ "${forward[1]}" = "ok_name=" ]
+}
+
+@test "forward build: whitespace trimmed, empty entries skipped" {
+    export OPENV_FWD_A='1' OPENV_FWD_B='2'
+    OPENV_PRESERVE_VARS=' OPENV_FWD_A , , OPENV_FWD_B ,' build_forward
+    [ "${#forward[@]}" -eq 3 ]
+    [ "${forward[1]}" = "OPENV_FWD_A=1" ]
+    [ "${forward[2]}" = "OPENV_FWD_B=2" ]
+    unset OPENV_FWD_A OPENV_FWD_B
 }
 
 # ---------------------------------------------------------------------------

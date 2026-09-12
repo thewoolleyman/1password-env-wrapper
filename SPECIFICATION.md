@@ -367,6 +367,37 @@ All shell scripts in this repository SHALL:
        cross the boundary. macOS performs no `env -i` scrub, so
        caller-supplied variables already pass through to the final
        command; this opt-in is therefore inert there.
+
+       On Linux this allowlist is read at Stage 1, which sudo's
+       `env_reset` is reached only after. Stage 0 SHALL therefore
+       forward `OPENV_PRESERVE_VARS` itself, and a `NAME=<current
+       value>` operand for each name it lists, on the escalating
+       `sudo` command line, by the same technique already used for
+       `OP_ENV_WRAPPER_CACHE_TTL`. Without that forwarding the
+       allowlist and every variable it names are destroyed before the
+       code that reads them runs, so the mechanism does nothing on a
+       plain invocation and works only when the caller has separately
+       wrapped the whole call in an external `sudo -E`.
+
+       Stage 0 SHALL refuse to forward a name that is not a shell
+       identifier (`[A-Za-z_][A-Za-z0-9_]*`), and SHALL refuse the
+       names that the dynamic loader or bash honour before the
+       privileged stage runs (`LD_*`, `BASH_*`, `GLIBC_*`, `PYTHON*`,
+       `PERL5*`, `ENV`, `BASHOPTS`, `SHELLOPTS`, `PS4`, `IFS`, `PATH`,
+       `SHELL`, `HOME`, `TMPDIR`), the names the privileged stage
+       itself relies on (`SUDO_*`, `WRAPPER_STAGE`,
+       `OP_SERVICE_ACCOUNT_TOKEN`), and the two control variables
+       (`OPENV_PRESERVE_VARS`, `OPENV_KEEP_PRIVILEGES`). The
+       escalation boundary stays deliberate: a caller who can name a
+       variable SHALL NOT thereby be able to steer the root stage.
+
+       `OPENV_KEEP_PRIVILEGES` is refused for a sharper reason and
+       SHALL remain so. The sudoers fragment of Architecture
+       Principles §6 grants the `IDENTIFIER` group passwordless `sudo`
+       for this wrapper, so forwarding that flag across this hop would
+       turn group membership into arbitrary root execution. It keeps
+       requiring an external `sudo -E`, where the caller has already
+       demonstrated the privilege.
    - On **macOS**, the secure store is the per-user **login
      Keychain**, stored as a generic password under service name
      `<IDENTIFIER>` and account name `OP_SERVICE_ACCOUNT_TOKEN`,

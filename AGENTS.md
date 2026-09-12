@@ -184,8 +184,7 @@ with-openbrain-env.sh -- ./some-tool --flag value
 ### Advanced opt-ins (default-off): `OPENV_KEEP_PRIVILEGES`, `OPENV_PRESERVE_VARS`
 
 Two Linux opt-in env vars — no effect unless set — for admin tooling that must
-reach a root-only resource. They take effect only when the wrapper is invoked via
-an external `sudo -E` (so they survive into the privileged stage). Full contract in
+reach a root-only resource. Full contract in
 [`SPECIFICATION.md`](SPECIFICATION.md):
 
 - **`OPENV_KEEP_PRIVILEGES=1`** — skip the default drop-to-invoker; run the child
@@ -194,11 +193,24 @@ an external `sudo -E` (so they survive into the privileged stage). Full contract
   `HOME` is handled to match the kept uid so `op run` doesn't trip its
   config-dir ownership check.
 - **`OPENV_PRESERVE_VARS="A,B"`** — carry the named caller-set vars through the
-  stage-1 `env -i` scrub into the child, instead of being stripped.
+  stage-1 `env -i` scrub into the child, instead of being stripped. This works on
+  a plain invocation: stage 0 forwards the allowlist and each variable it names
+  across its own `sudo` hop, so no external `sudo -E` is needed.
+  `OPENV_PRESERVE_VARS=SOME_VAR with-<id>-env.sh <command>`.
+
+**`OPENV_KEEP_PRIVILEGES` still requires an external `sudo -E`, deliberately.**
+Stage 0 refuses to forward it, because the installed sudoers fragment grants the
+IDENTIFIER group passwordless `sudo` for the wrapper; forwarding the flag would
+turn group membership into arbitrary root execution. Example:
+`OPENV_KEEP_PRIVILEGES=1 OPENV_PRESERVE_VARS=SOME_SECRET sudo -E with-<id>-env.sh <admin-command>`.
+
+Stage 0 also refuses to forward a name that is not a shell identifier, and the
+names the loader, bash, or the privileged stage itself rely on (`LD_*`, `BASH_*`,
+`PATH`, `IFS`, `SHELLOPTS`, `ENV`, `PS4`, `SHELL`, `HOME`, `TMPDIR`, `SUDO_*`,
+`WRAPPER_STAGE`, `OP_SERVICE_ACCOUNT_TOKEN`). Naming one of those is silently a
+no-op rather than an error; the allowlist itself still crosses.
 
 Both stay project-agnostic — the wrapper hard-codes nothing about any consumer.
-Generic example:
-`OPENV_KEEP_PRIVILEGES=1 OPENV_PRESERVE_VARS=SOME_SECRET sudo -E with-<id>-env.sh <admin-command>`.
 
 ### TTL cache of the resolved environment: `OP_ENV_WRAPPER_CACHE_TTL`
 
