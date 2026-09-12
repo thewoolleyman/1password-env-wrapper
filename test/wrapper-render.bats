@@ -90,6 +90,17 @@ setup_file() {
 # template, lifted verbatim so the test exercises the real algorithm
 # (whitespace trim, empty-entry skip, missing-var -> NAME=). Keep this
 # in sync with the `preserve+=(...)` block in render_wrapper.
+openv_name_refused() {
+    case "$1" in
+        [!A-Za-z_]*|*[!A-Za-z0-9_]*) return 0 ;;
+        LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) return 0 ;;
+        ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) return 0 ;;
+        SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) return 0 ;;
+        OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) return 0 ;;
+    esac
+    return 1
+}
+
 build_preserve() {
     preserve=()
     if [ -n "${OPENV_PRESERVE_VARS:-}" ]; then
@@ -98,6 +109,7 @@ build_preserve() {
             _openv_n="${_openv_n#"${_openv_n%%[![:space:]]*}"}"
             _openv_n="${_openv_n%"${_openv_n##*[![:space:]]}"}"
             [ -n "$_openv_n" ] || continue
+            if openv_name_refused "$_openv_n"; then continue; fi
             preserve+=( "$_openv_n=$(printenv "$_openv_n" 2>/dev/null || true)" )
         done
     fi
@@ -116,13 +128,7 @@ build_forward() {
             _fwd_n="${_fwd_n#"${_fwd_n%%[![:space:]]*}"}"
             _fwd_n="${_fwd_n%"${_fwd_n##*[![:space:]]}"}"
             [ -n "$_fwd_n" ] || continue
-            case "$_fwd_n" in
-                [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;;
-                LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) continue ;;
-                ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) continue ;;
-                SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) continue ;;
-                OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) continue ;;
-            esac
+            if openv_name_refused "$_fwd_n"; then continue; fi
             forward+=( "$_fwd_n=$(printenv "$_fwd_n" 2>/dev/null || true)" )
         done
     fi
@@ -432,6 +438,55 @@ default_drop_branch() {
     [ "${forward[1]}" = "OPENV_FWD_A=1" ]
     [ "${forward[2]}" = "OPENV_FWD_B=2" ]
     unset OPENV_FWD_A OPENV_FWD_B
+}
+
+# ---------------------------------------------------------------------------
+# The refusal set is shared by BOTH builds.
+#
+# Stage 0 forwards the allowlist itself unconditionally, so a name refused only
+# at stage 0 is still rebuilt at stage 1 — out of the PRIVILEGED stage's
+# environment rather than the caller's. Measured live before this was closed:
+# OPENV_PRESERVE_VARS=HOME put root's home into a child running as the invoker,
+# and OPENV_PRESERVE_VARS=LD_PRELOAD spliced an empty LD_PRELOAD into the child.
+# ---------------------------------------------------------------------------
+
+@test "the refusal helper is defined once and used by both builds" {
+    grep -Fq 'openv_name_refused() {' "$RENDERED"
+    run grep -cF 'if openv_name_refused "$' "$RENDERED"
+    [ "$output" -eq 2 ]
+}
+
+@test "refusal: stage-1 preserve refuses HOME, so root's home cannot reach the child" {
+    export HOME_PROBE_UNUSED=1
+    OPENV_PRESERVE_VARS='HOME' build_preserve
+    [ "${#preserve[@]}" -eq 0 ]
+    unset HOME_PROBE_UNUSED
+}
+
+@test "refusal: stage-1 preserve refuses loader and shell names" {
+    OPENV_PRESERVE_VARS='LD_PRELOAD,BASH_ENV,PATH,IFS,SHELLOPTS,ENV,PS4,TMPDIR,SHELL' build_preserve
+    [ "${#preserve[@]}" -eq 0 ]
+}
+
+@test "refusal: stage-1 preserve refuses the privileged stage's own names" {
+    OPENV_PRESERVE_VARS='WRAPPER_STAGE,OP_SERVICE_ACCOUNT_TOKEN,SUDO_UID,SUDO_USER' build_preserve
+    [ "${#preserve[@]}" -eq 0 ]
+}
+
+@test "refusal: the OPENV_* control variables are not injected into the child" {
+    OPENV_PRESERVE_VARS='OPENV_PRESERVE_VARS,OPENV_KEEP_PRIVILEGES' build_preserve
+    [ "${#preserve[@]}" -eq 0 ]
+}
+
+@test "refusal: an ordinary name is still carried by both builds" {
+    export OPENV_ORDINARY='kept'
+    OPENV_PRESERVE_VARS='OPENV_ORDINARY' build_preserve
+    [ "${#preserve[@]}" -eq 1 ]
+    [ "${preserve[0]}" = "OPENV_ORDINARY=kept" ]
+    OPENV_PRESERVE_VARS='OPENV_ORDINARY' build_forward
+    [ "${#forward[@]}" -eq 2 ]
+    [ "${forward[1]}" = "OPENV_ORDINARY=kept" ]
+    unset OPENV_ORDINARY
 }
 
 # ---------------------------------------------------------------------------

@@ -210,6 +210,37 @@ die()  { err "\$@"; exit 1; }
 # in exactly one place.
 op_rate_limit_hint() { err "op run exited 9 — most likely the 1Password service-account rate limit. The account-wide DAILY quota is SHARED across every tenant on this 1Password account and resets on a ~24h window; per-token HOURLY limits reset ~59m. A short retry will NOT clear it — stop and wait, or cut op-run frequency. See https://www.1password.dev/service-accounts/rate-limits/"; }
 
+# Names that SHALL NOT cross via OPENV_PRESERVE_VARS. Shared by the stage-0
+# forward build and the stage-1 preserve build so the two cannot drift.
+#
+# Refusing at BOTH sites is what makes the refusal real. Stage 0 forwards the
+# ALLOWLIST ITSELF unconditionally, so a name refused only at stage 0 is still
+# rebuilt at stage 1 out of the PRIVILEGED stage's environment rather than the
+# caller's. That is not theoretical: OPENV_PRESERVE_VARS=HOME put root's home
+# into a child running as the invoker, and OPENV_PRESERVE_VARS=LD_PRELOAD
+# spliced an empty LD_PRELOAD into the child's environment.
+#
+# A name must look like a shell identifier. The dynamic loader's and bash's own
+# control names are refused because they are honoured before any of this code
+# runs. The names the privileged stage relies on are refused. The two OPENV_*
+# control variables are refused so a caller cannot re-inject them into the
+# child, which SPECIFICATION.md already requires.
+#
+# The closing brace below is INDENTED deliberately. test/wrapper-render.bats
+# extracts this template by reading to the first lone closing brace at column
+# zero, so a column-zero brace here truncates the rendered sample and every
+# render test fails in setup_file. Bash accepts an indented terminator.
+openv_name_refused() {
+    case "\$1" in
+        [!A-Za-z_]*|*[!A-Za-z0-9_]*) return 0 ;;
+        LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) return 0 ;;
+        ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) return 0 ;;
+        SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) return 0 ;;
+        OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) return 0 ;;
+    esac
+    return 1
+    }
+
 # Drop -- separator if present.
 if [ "\$#" -gt 0 ] && [ "\$1" = "--" ]; then
     shift
@@ -291,13 +322,7 @@ case "\$(uname -s)" in
                         _fwd_n="\${_fwd_n#"\${_fwd_n%%[![:space:]]*}"}"
                         _fwd_n="\${_fwd_n%"\${_fwd_n##*[![:space:]]}"}"
                         [ -n "\$_fwd_n" ] || continue
-                        case "\$_fwd_n" in
-                            [!A-Za-z_]*|*[!A-Za-z0-9_]*) continue ;;
-                            LD_*|BASH_*|GLIBC_*|PYTHON*|PERL5*) continue ;;
-                            ENV|BASHOPTS|SHELLOPTS|PS4|IFS|PATH|SHELL|HOME|TMPDIR) continue ;;
-                            SUDO_*|WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN) continue ;;
-                            OPENV_PRESERVE_VARS|OPENV_KEEP_PRIVILEGES) continue ;;
-                        esac
+                        if openv_name_refused "\$_fwd_n"; then continue; fi
                         forward+=( "\$_fwd_n=\$(printenv "\$_fwd_n" 2>/dev/null || true)" )
                     done
                 fi
@@ -344,6 +369,7 @@ case "\$(uname -s)" in
                         _openv_n="\${_openv_n#"\${_openv_n%%[![:space:]]*}"}"
                         _openv_n="\${_openv_n%"\${_openv_n##*[![:space:]]}"}"
                         [ -n "\$_openv_n" ] || continue
+                        if openv_name_refused "\$_openv_n"; then continue; fi
                         preserve+=( "\$_openv_n=\$(printenv "\$_openv_n" 2>/dev/null || true)" )
                     done
                 fi
