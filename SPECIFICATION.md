@@ -881,13 +881,26 @@ entirely.
   treated as a miss rather than being handed to `env`, where a
   bare non-assignment token would be misread as the start of the
   command rather than an assignment.
+- Cached diffs SHALL be bound to the exact caller baseline from which
+  they were derived. The cache key includes a versioned SHA-256 digest
+  of the sorted, NUL-delimited baseline (excluding the token and stage
+  sentinel). A nested caller that already holds Environment values
+  therefore cannot populate an incomplete cache entry for a bare caller.
+  Fingerprinting SHALL NOT put baseline values in argv, logs, or temporary
+  files. Its failure falls back to the normal uncached path with a
+  diagnostic. Old unbound entries are ignored. Distinct caller environments
+  may occupy distinct entries until their ordinary TTL expires; changing
+  unrelated ambient variables may cause another miss, but identical
+  baselines retain warm hits.
 - On a cache **miss**, Stage 2 SHALL resolve the Environment via
   **exactly one** `op run --no-masking --environment <ID> -- env -u
   OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0` call whose target is
   an introspection command (`env -0`), not the real command, so the
   wrapper can diff the result against a pre-op baseline snapshot of
-  its own environment and learn exactly which variables op injected
-  or overrode. Only that diff is written to the cache; the real
+  its own environment and learn which variables op changed relative to
+  that baseline. This does not identify Environment membership: inherited
+  values may already be equal. Only that caller-bound diff is written to
+  the cache; the real
   command is then launched directly by the wrapper itself (never as
   a child of `op`) with the full resolved set applied on top of the
   current environment. A cache miss therefore costs the same single

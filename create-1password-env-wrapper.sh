@@ -404,7 +404,7 @@ case "\$(uname -s)" in
                 #
                 # HOME is skipped ONLY under OPENV_KEEP_PRIVILEGES, where the
                 # child stays root and stage 1 deliberately set HOME to root's
-                # own home so `op run` accepts its config directory. That is an
+                # own home so \`op run\` accepts its config directory. That is an
                 # op ownership constraint, not a privilege boundary.
                 if [ -n "\${OPENV_CALLER_ENV_FILE:-}" ]; then
                     if [ -r "\$OPENV_CALLER_ENV_FILE" ]; then
@@ -478,10 +478,11 @@ case "\$(uname -s)" in
                 # irrelevant here since every cached key inside it carries
                 # its own shorter TTL.)
                 #
-                # Only the variables op run actually injects are cached — never
+                # Only the changes relative to the caller are cached — never
                 # the wrapper's whole ambient environment — so a cache hit can
                 # never replay a stale snapshot of unrelated caller-set
-                # variables into a later invocation; it only re-forces the same
+                # variables into a later invocation. The key binds this diff
+                # to its exact baseline; it only re-forces the same
                 # 1Password-sourced values a live \`op run\` would have produced
                 # (per the "1Password value wins" override rule below). Any
                 # cache miss or cache-path anomaly falls through unchanged to
@@ -595,7 +596,22 @@ case "\$(uname -s)" in
                 fi
 
                 if [ -n "\$persistent_kr" ]; then
-                    cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}"
+                    # A diff belongs to its baseline, not just its Environment.
+                    # A nested caller can already carry every secret: replaying
+                    # its near-empty diff to a bare caller would omit them all.
+                    # Bind hits to a sorted, NUL-framed digest of the exact
+                    # baseline. Only the digest enters the key description;
+                    # values remain in memory, never argv or a temporary file.
+                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t baseline_arr
+                    if ! baseline_hash="\$(printf '%s\\0' "\${baseline_arr[@]}" | LC_ALL=C sort -z | sha256sum)"; then
+                        err "TTL cache bypassed: could not fingerprint the caller environment"
+                        persistent_kr=""
+                    fi
+                fi
+
+                if [ -n "\$persistent_kr" ]; then
+                    # Versioned namespace excludes every old caller-unbound key.
+                    cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}:caller-v1:\${baseline_hash%% *}"
 
                     # --- cache hit? ---
                     assign=()
@@ -626,7 +642,6 @@ case "\$(uname -s)" in
                     # launch the real command ourselves. This is the ONLY
                     # \`op run\` call on a cache miss — the real command never
                     # runs under op.
-                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t baseline_arr
                     declare -A base_map=()
                     for kv in "\${baseline_arr[@]}"; do
                         base_map["\${kv%%=*}"]="\${kv#*=}"
