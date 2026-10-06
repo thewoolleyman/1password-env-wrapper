@@ -248,6 +248,14 @@ automatically; no action is needed either way. Full design and
 failure-mode contract: SPECIFICATION.md § "TTL cache of the
 op-resolved environment".
 
+Cache entries are bound to a versioned SHA-256 fingerprint of the caller's
+environment. This prevents a nested caller's partial diff from withholding
+credentials from another caller (issue #17); old unbound entries are ignored.
+Identical caller environments keep warm hits. Changing ambient variables can
+cause another miss and another TTL-bounded entry, a correctness tradeoff that
+can increase cache occupancy and resolution frequency. Fingerprinting streams
+NUL-delimited values in memory; it does not put them in argv or files.
+
 **A revoked/dead session keyring is the common case, not an edge
 case, and is handled automatically.** The Linux kernel session
 keyring (`@s`) that the cache lives behind gets REVOKED by
