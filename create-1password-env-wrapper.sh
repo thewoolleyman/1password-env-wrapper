@@ -610,6 +610,57 @@ case "\$(uname -s)" in
                 fi
 
                 if [ -n "\$persistent_kr" ]; then
+                    # Keyring housekeeping (issue #19). Every distinct caller
+                    # baseline owns its own entry (above), so a busy host
+                    # fans out to many ~5 KB entries per identifier, all
+                    # charged to this uid's kernel.keys.maxbytes. Expired
+                    # entries are NOT reliably reaped by the kernel while
+                    # still linked from the persistent keyring (measured:
+                    # \`expd\` entries sat there well past gc_delay), so they
+                    # kept their bytes until the quota was exhausted and
+                    # every store failed. The wrapper therefore cleans up
+                    # after itself: on every miss it unlinks its own expired
+                    # entries, and if a store still hits the quota it evicts
+                    # its own live entries, the soonest-to-expire first.
+                    #
+                    # Only keys of type \`user\`, owned by this uid, whose
+                    # description starts with \`op-env-wrapper-cache:\` are
+                    # ever touched (every identifier's wrapper shares that
+                    # prefix, and evicting another identifier's entry costs
+                    # it one extra resolve at most). /proc/keys is the only
+                    # interface that still shows an expired key's
+                    # description and a live key's remaining lifetime;
+                    # \`keyctl describe\` refuses expired keys outright.
+                    # Reads stdin (/proc/keys); \$1 selects what to print:
+                    #   expired -> one decimal key id per line
+                    #   live    -> "<seconds-left> <decimal key id>" per line
+                    cache_select() {
+                        local id flags usage timeout perm uid gid type desc rest n
+                        while read -r id flags usage timeout perm uid gid type desc rest; do
+                            [ "\$type" = user ] && [ "\$uid" = "\$EUID" ] || continue
+                            case "\$desc" in op-env-wrapper-cache:*) ;; *) continue ;; esac
+                            case "\$id" in ''|*[!0-9a-fA-F]*) continue ;; esac
+                            if [ "\$timeout" = expd ]; then
+                                if [ "\$1" = expired ]; then printf '%s\\n' "\$((16#\$id))"; fi
+                                continue
+                            fi
+                            [ "\$1" = live ] || continue
+                            # Kernel format: Ns, Nm, Nh, Nd, Nw (or perm).
+                            n="\${timeout%[smhdw]}"
+                            case "\$n" in ''|*[!0-9]*) continue ;; esac
+                            case "\$timeout" in
+                                *m) n=\$((n * 60)) ;;
+                                *h) n=\$((n * 3600)) ;;
+                                *d) n=\$((n * 86400)) ;;
+                                *w) n=\$((n * 604800)) ;;
+                            esac
+                            printf '%s %s\\n' "\$n" "\$((16#\$id))"
+                        done
+                        return 0
+                    }
+                fi
+
+                if [ -n "\$persistent_kr" ]; then
                     # Versioned namespace excludes every old caller-unbound key.
                     cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}:caller-v1:\${baseline_hash%% *}"
 
@@ -647,6 +698,14 @@ case "\$(uname -s)" in
                         base_map["\${kv%%=*}"]="\${kv#*=}"
                     done
 
+                    # Reap expired entries BEFORE the resolve: the kernel
+                    # frees an unlinked key's bytes asynchronously (measured:
+                    # not yet freed immediately after unlink, freed ~50 ms
+                    # later), and the op call below gives it ample time.
+                    { cache_select expired < /proc/keys; } 2>/dev/null | while read -r reap_id; do
+                        keyctl unlink "\$reap_id" "\$persistent_kr" >/dev/null 2>&1 || true
+                    done || true
+
                     op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t resolved_arr
                     op_rc="\${PIPESTATUS[0]}"
                     if [ "\$op_rc" -eq 0 ]; then
@@ -661,10 +720,42 @@ case "\$(uname -s)" in
                             fi
                         done
                         if [ "\${#injected[@]}" -gt 0 ]; then
-                            if new_key_id="\$(printf '%s\0' "\${injected[@]}" | keyctl padd user "\$cache_desc" "\$persistent_kr" 2>/dev/null)"; then
-                                keyctl timeout "\$new_key_id" "\$cache_ttl" >/dev/null 2>&1 || true
-                            else
-                                err "TTL cache: failed to store the resolved Environment (commonly: kernel.keys.maxbytes/maxkeys quota exceeded on the persistent keyring) — this invocation still succeeds, but every call will keep resolving via op run (one more draw on the 1Password service account's SHARED DAILY quota) until the keyring quota is freed"
+                            # Store, evicting on quota exhaustion. stderr is
+                            # captured (keyctl prints only the key id on
+                            # success, only an error message on failure, and
+                            # never the payload) so a failure names the real
+                            # cause instead of a guess. Only a quota error
+                            # triggers eviction; anything else (EPERM, ...)
+                            # cannot be cured by freeing space. Each retry
+                            # sleeps briefly, because an evicted key's bytes
+                            # come back asynchronously (see the reap above).
+                            evict=()
+                            evict_loaded=0
+                            stored=0
+                            store_tries=0
+                            while :; do
+                                if padd_out="\$(printf '%s\\0' "\${injected[@]}" | keyctl padd user "\$cache_desc" "\$persistent_kr" 2>&1)"; then
+                                    keyctl timeout "\$padd_out" "\$cache_ttl" >/dev/null 2>&1 || true
+                                    stored=1
+                                    break
+                                fi
+                                case "\$padd_out" in *[Qq]uota*) ;; *) break ;; esac
+                                store_tries=\$((store_tries + 1))
+                                [ "\$store_tries" -le 32 ] || break
+                                if [ "\$evict_loaded" -eq 0 ]; then
+                                    { cache_select live < /proc/keys; } 2>/dev/null | LC_ALL=C sort -n | mapfile -t evict || true
+                                    evict_loaded=1
+                                fi
+                                if [ "\${#evict[@]}" -gt 0 ]; then
+                                    keyctl unlink "\${evict[0]##* }" "\$persistent_kr" >/dev/null 2>&1 || true
+                                    evict=("\${evict[@]:1}")
+                                elif [ "\$store_tries" -gt 3 ]; then
+                                    break  # nothing left to evict; the quota belongs to something else
+                                fi
+                                sleep 0.1
+                            done
+                            if [ "\$stored" -eq 0 ]; then
+                                err "TTL cache: failed to store the resolved Environment (keyctl: \${padd_out:-no error message}) — this invocation still succeeds, but every call will keep resolving via op run (one more draw on the 1Password service account's SHARED DAILY quota) until the keyring has room"
                             fi
                         fi
                         exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
