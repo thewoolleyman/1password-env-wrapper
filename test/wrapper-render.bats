@@ -560,10 +560,10 @@ load_cache_select() {
     load_cache_select
     local other_uid=$((EUID + 1)) fixture="$BATS_TEST_TMPDIR/keys"
     cat > "$fixture" <<KEYS
-0000000a I--Q---     1 expd 3f010000  $EUID  $EUID user      op-env-wrapper-cache:livespec:env:caller-v1:aaa: 5413
-0000000b I--Q---     1  33s 3f010000  $EUID  $EUID user      op-env-wrapper-cache:livespec:env:caller-v1:bbb: 5413
-0000000c I--Q---     1   4m 3f010000  $EUID  $EUID user      op-env-wrapper-cache:openbrain:env:caller-v1:ccc: 5413
-0000000d I--Q---     1   1h 3f010000  $EUID  $EUID user      op-env-wrapper-cache:dolt-admin:env: 1174
+0000000a I--Q---     1 expd 3f010000  $EUID  $EUID user      op-env-wrapper-cache:alpha:env:caller-v1:aaa: 5413
+0000000b I--Q---     1  33s 3f010000  $EUID  $EUID user      op-env-wrapper-cache:alpha:env:caller-v1:bbb: 5413
+0000000c I--Q---     1   4m 3f010000  $EUID  $EUID user      op-env-wrapper-cache:beta:env:caller-v1:ccc: 5413
+0000000d I--Q---     1   1h 3f010000  $EUID  $EUID user      op-env-wrapper-cache:gamma:env: 1174
 0000000e I--Q---     1 expd 3f010000  $EUID  $EUID user      someone-else:key: 10
 0000000f I--Q---     1 expd 3f010000  $other_uid $other_uid user op-env-wrapper-cache:x:env: 10
 00000010 IR-Q---   348 expd 3f030000  $EUID  $EUID keyring   _ses: empty
