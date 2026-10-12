@@ -313,7 +313,8 @@ default_drop_branch() {
 }
 
 @test "HOME is held back only where the child stays root, for op's config-dir check" {
-    grep -Fq '[ "${OPENV_KEEP_PRIVILEGES:-0}" = "1" ] && [ "$_restore_n" = "HOME" ]' "$RENDERED"
+    grep -Fq 'if [ "${OPENV_KEEP_PRIVILEGES:-0}" = "1" ]; then' "$RENDERED"
+    grep -Fq 'case "$_restore_kv" in HOME=*) ;; *) _kept+=("$_restore_kv") ;; esac' "$RENDERED"
 }
 
 @test "the restore runs BEFORE the op resolve, so 1Password wins a name collision" {
@@ -440,7 +441,7 @@ default_drop_branch() {
     grep -Fq "keyctl pipe \"\$key_id\" 2>/dev/null | mapfile -d '' -t assign" "$RENDERED"
     grep -Fq "keyctl padd user \"\$cache_desc\" \"\$persistent_kr\"" "$RENDERED"
     grep -Fq "printf '%s" "$RENDERED"
-    grep -Fq "env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t baseline_arr" "$RENDERED"
+    grep -Fq "env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 \"\${caller_env[@]}\" | mapfile -d '' -t baseline_arr" "$RENDERED"
 }
 
 @test "a cache-hit replay entry is sanity-checked for '=' before being trusted as an env operand" {
@@ -456,8 +457,8 @@ default_drop_branch() {
     # One for the cache-hit replay, one for the freshly-resolved cache-miss
     # launch — both bypass op entirely for the child, so both must repeat
     # the same -u strip the uncached op-run path gets from op's own env -u.
-    run grep -cF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign[@]}" "$@"' "$RENDERED"
-    [ "$output" -eq 2 ]
+    grep -qF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${caller_env[@]}" "${assign[@]}" "$@"' "$RENDERED"
+    grep -qF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign[@]}" "$@"' "$RENDERED"
 }
 
 @test "a cache miss resolves via an introspection target (env -0), never the real command, under op" {
@@ -588,9 +589,49 @@ KEYS
     local reap op hit
     reap="$(grep -n 'cache_select expired < /proc/keys' "$RENDERED" | cut -d: -f1)"
     op="$(grep -n 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED" | cut -d: -f1)"
-    hit="$(grep -n 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign\[@\]}" "$@"' "$RENDERED" | head -1 | cut -d: -f1)"
+    hit="$(grep -n 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${caller_env\[@\]}" "${assign\[@\]}" "$@"' "$RENDERED" | head -1 | cut -d: -f1)"
     [ "$hit" -lt "$reap" ]
     [ "$reap" -lt "$op" ]
+}
+
+@test "runtime: caller entries a shell cannot export (functions, dotted names, readonly collisions) still pass through" {
+    local fakebin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fakebin" "$BATS_TEST_TMPDIR/cache"
+    export TEST_CACHE_DIR="$BATS_TEST_TMPDIR/cache"
+    cat > "$fakebin/keyctl" <<'FAKE'
+#!/usr/bin/env bash
+digest() { printf '%s' "$1" | sha256sum | cut -d ' ' -f1; }
+case "$1" in
+    get_persistent) echo 123 ;;
+    search) key="$(digest "$4")"; [ -f "$TEST_CACHE_DIR/$key" ] || exit 1; echo "$key" ;;
+    padd) key="$(digest "$3")"; cat > "$TEST_CACHE_DIR/$key"; echo "$key" ;;
+    pipe) cat "$TEST_CACHE_DIR/$2" ;;
+    *) : ;;
+esac
+FAKE
+    cat > "$fakebin/op" <<'FAKE'
+#!/usr/bin/env bash
+while [ "$1" != -- ]; do shift; done
+shift
+export TEST_SECRET=canonical
+exec "$@"
+FAKE
+    chmod +x "$fakebin/keyctl" "$fakebin/op"
+    local probe='f && printf "%s|%s|%s|%s|%s|%s\n" "$(printenv npm.cfg)" "$IDENTIFIER" "${OP_CONNECT_HOST-unset}" "$OP_CACHE" "$TEST_SECRET" "$ONEPASSWORD_ENVIRONMENT_ID"'
+    local capture ttl
+    for ttl in 0 300 300; do   # uncached, cache miss, cache hit
+        capture="$BATS_TEST_TMPDIR/caller-env-$ttl-$RANDOM"
+        env -i PATH="$fakebin:$PATH" HOME="$HOME" 'npm.cfg=dotted' IDENTIFIER=caller-id \
+            ONEPASSWORD_ENVIRONMENT_ID=caller-env OP_CONNECT_HOST=http://evil OP_CACHE=true \
+            BASH_FUNC_f%%='() {  true
+}' env -0 > "$capture"
+        run env -i PATH="$fakebin:$PATH" HOME="$HOME" WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake \
+            OP_ENV_WRAPPER_CACHE_TTL="$ttl" OPENV_CALLER_ENV_FILE="$capture" \
+            bash "$RENDERED" bash -c "$probe"
+        [ "$status" -eq 0 ]
+        [ "$output" = "dotted|caller-id|unset|false|canonical|caller-env" ]
+        [ ! -e "$capture" ]
+    done
 }
 
 # Shared fake for the store-path runtime tests. TEST_PADD_MODE:
