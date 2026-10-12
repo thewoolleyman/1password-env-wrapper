@@ -892,6 +892,30 @@ entirely.
   may occupy distinct entries until their ordinary TTL expires; changing
   unrelated ambient variables may cause another miss, but identical
   baselines retain warm hits.
+- **Keyring housekeeping.** Because entries fan out per caller baseline,
+  the wrapper SHALL manage its own share of the uid's
+  `kernel.keys.maxbytes`/`maxkeys` quota, because the kernel was measured
+  NOT to reap expired entries that are still linked from the persistent
+  keyring (they stayed `expd`, keeping their bytes, well past `gc_delay`)
+  (issue #19). It SHALL touch only keys of type `user`, owned by the
+  invoking uid, whose description starts with `op-env-wrapper-cache:`
+  (the prefix every identifier shares), and SHALL identify them from
+  `/proc/keys`. That is the only interface that shows an expired key's
+  description and a live key's remaining lifetime, because `keyctl
+  describe` refuses expired keys. If `/proc/keys` is unreadable,
+  housekeeping is a no-op.
+  - On every cache miss, before the resolve, it SHALL unlink every such
+    entry that has expired. The kernel frees an unlinked key's bytes
+    asynchronously (measured: not freed immediately after unlink, freed
+    ~50 ms later), so reaping before the `op run` gives the kernel time
+    to free them before the store.
+  - If `keyctl padd` fails with a quota error, it SHALL evict such live
+    entries one at a time, the soonest-to-expire first, sleeping briefly
+    before each retry. The number of retries SHALL be bounded. Any other
+    `padd` error SHALL NOT trigger eviction.
+  - A store failure that survives this SHALL be reported with `keyctl`'s
+    own error message (captured from its stderr, which never carries the
+    payload), not a guessed cause.
 - On a cache **miss**, Stage 2 SHALL resolve the Environment via
   **exactly one** `op run --no-masking --environment <ID> -- env -u
   OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0` call whose target is
@@ -955,8 +979,8 @@ entirely.
 - A cache miss or **any** cache-path anomaly that recovery does not
   resolve (a missing `keyctl` binary, `keyctl get_persistent` still
   failing after `keyctl new_session`, a malformed or unreadable cache
-  entry, `keyctl padd` failing to store a resolved diff — commonly a
-  keyring quota exceeded) SHALL fall open to the uncached `op run`
+  entry, `keyctl padd` failing to store a resolved diff even after
+  the housekeeping above) SHALL fall open to the uncached `op run`
   path — never to a broken or incorrect result. Every such fall-open
   SHALL be reported on stderr naming the specific reason
   (`OP_ENV_WRAPPER_CACHE_TTL=0`, an intentional opt-out, is excluded —

@@ -274,20 +274,27 @@ SPECIFICATION.md § "Revoked/unusable session keyring recovery" for
 the measured behavior behind this (including that the recovery is
 NOT purely local to the calling process — see that section).
 
-**Keyring quota headroom matters once a host runs several
-identifiers.** Each cached Environment costs kernel memory against
-`kernel.keys.maxbytes`/`maxkeys` for the invoking uid (a resolved
-Environment with a couple of secrets is commonly several KB; a
-multi-line PEM-shaped secret pushes it further). The kernel
-defaults (`maxbytes=20000`, `maxkeys=200`) fit only 3-4 wrapper
-identifiers' worth of cache before `keyctl padd` starts failing with
-EDQUOT — silently, unless `OP_ENV_WRAPPER_DEBUG=1` or you're
-watching stderr, since a padd failure still lets the current call
-succeed (falling back to a live `op run` resolve every time,
-quietly re-consuming the 1Password service account's shared daily
-rate limit). If a host runs several distinct identifiers, raise
-`kernel.keys.maxbytes` and `kernel.keys.maxkeys` for that uid via a
-sysctl drop-in before relying on the cache across all of them.
+**Keyring quota headroom.** Cache entries are charged to the invoking
+uid's `kernel.keys.maxbytes`/`maxkeys`. Because entries are bound to the
+caller's environment fingerprint, one identifier can hold many ~5 KB
+entries at once (one per distinct caller environment within the TTL),
+not one: a busy host with many concurrent sessions and dispatches has
+been measured at 20+ entries for a single identifier. Size any sysctl
+drop-in for that fan-out, not for one entry per identifier. The kernel
+defaults (`maxbytes=20000`, `maxkeys=200`) fit only three or four entries.
+
+The wrapper manages its own share of the quota
+([#19](https://github.com/thewoolleyman/1password-env-wrapper/issues/19)).
+Expired entries were measured to stay linked, and keep their bytes, well
+past `gc_delay`, so on every cache miss the wrapper unlinks its own expired
+entries. If a store still hits the quota, it evicts its own live entries,
+the soonest-to-expire first, and retries. It only ever touches `user` keys
+owned by the invoking uid whose description starts with
+`op-env-wrapper-cache:`. If a store still fails (the quota is consumed by
+something other than this wrapper, or a non-quota error), the call still
+succeeds via a live `op run`, and a warning quoting `keyctl`'s own error
+always goes to stderr. Every such call draws on the 1Password service
+account's shared daily rate limit.
 
 ## Open an interactive shell via the wrapper
 

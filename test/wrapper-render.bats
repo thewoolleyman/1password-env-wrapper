@@ -432,7 +432,7 @@ default_drop_branch() {
     grep -Fq 'persistent_kr="$(keyctl get_persistent @s 2>/dev/null)"' "$RENDERED"
     grep -Fq 'keyctl search "$persistent_kr" user "$cache_desc"' "$RENDERED"
     grep -Fq 'keyctl padd user "$cache_desc" "$persistent_kr"' "$RENDERED"
-    grep -Fq 'keyctl timeout "$new_key_id" "$cache_ttl"' "$RENDERED"
+    grep -Fq 'keyctl timeout "$padd_out" "$cache_ttl"' "$RENDERED"
     ! grep -Eq 'keyctl (search|padd)[^"]*"[^"]*"[^"]* @u\b' "$RENDERED"
 }
 
@@ -540,6 +540,156 @@ FAKE
     [ "$status" -eq 0 ]
     [[ "$output" == *'could not fingerprint the caller environment'* ]]
     [[ "$output" == *fallback ]]
+}
+
+# ---------------------------------------------------------------------------
+# Keyring housekeeping (issue #19): caller-bound entries fan out, and expired
+# entries kept their maxbytes charge until every store failed. The wrapper
+# reaps its own expired entries on a miss and evicts its own live entries,
+# soonest-to-expire first, when a store hits the quota.
+# ---------------------------------------------------------------------------
+
+# Lift cache_select out of the RENDERED wrapper (not a copy of the template),
+# so these tests exercise the exact bytes that ship.
+load_cache_select() {
+    eval "$(sed -n '/^ *cache_select() {$/,/^                    }$/p' "$RENDERED")"
+    declare -F cache_select >/dev/null
+}
+
+@test "housekeeping: cache_select picks only this uid's own wrapper user keys from /proc/keys" {
+    load_cache_select
+    local other_uid=$((EUID + 1)) fixture="$BATS_TEST_TMPDIR/keys"
+    cat > "$fixture" <<KEYS
+0000000a I--Q---     1 expd 3f010000  $EUID  $EUID user      op-env-wrapper-cache:livespec:env:caller-v1:aaa: 5413
+0000000b I--Q---     1  33s 3f010000  $EUID  $EUID user      op-env-wrapper-cache:livespec:env:caller-v1:bbb: 5413
+0000000c I--Q---     1   4m 3f010000  $EUID  $EUID user      op-env-wrapper-cache:openbrain:env:caller-v1:ccc: 5413
+0000000d I--Q---     1   1h 3f010000  $EUID  $EUID user      op-env-wrapper-cache:dolt-admin:env: 1174
+0000000e I--Q---     1 expd 3f010000  $EUID  $EUID user      someone-else:key: 10
+0000000f I--Q---     1 expd 3f010000  $other_uid $other_uid user op-env-wrapper-cache:x:env: 10
+00000010 IR-Q---   348 expd 3f030000  $EUID  $EUID keyring   _ses: empty
+00000011 I--Q---     1 perm 3f010000  $EUID  $EUID user      op-env-wrapper-cache:perm:env: 10
+00000012 I--Q---     1 expd 3f010000  $EUID  $EUID logon     op-env-wrapper-cache:logon:env: 10
+KEYS
+    run cache_select expired < "$fixture"
+    [ "$status" -eq 0 ]
+    [ "$output" = 10 ]
+    run cache_select live < "$fixture"
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(printf '33 11\n240 12\n3600 13')" ]
+    run cache_select live < /dev/null
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "housekeeping: expired entries are reaped before the resolve, and a missing /proc/keys is harmless" {
+    grep -Fq '{ cache_select expired < /proc/keys; } 2>/dev/null | while read -r reap_id; do' "$RENDERED"
+    grep -Fq 'keyctl unlink "$reap_id" "$persistent_kr"' "$RENDERED"
+    # Reaping sits after the hit check and before the single op resolve.
+    local reap op hit
+    reap="$(grep -n 'cache_select expired < /proc/keys' "$RENDERED" | cut -d: -f1)"
+    op="$(grep -n 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED" | cut -d: -f1)"
+    hit="$(grep -n 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign\[@\]}" "$@"' "$RENDERED" | head -1 | cut -d: -f1)"
+    [ "$hit" -lt "$reap" ]
+    [ "$reap" -lt "$op" ]
+}
+
+# Shared fake for the store-path runtime tests. TEST_PADD_MODE:
+#   quota-once  -> first padd fails with EDQUOT, later ones succeed
+#   quota       -> every padd fails with EDQUOT
+#   eperm       -> every padd fails with EACCES
+make_store_fakes() {
+    fakebin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fakebin"
+    export TEST_LOG="$BATS_TEST_TMPDIR/keyctl.log"
+    : > "$TEST_LOG"
+    cat > "$fakebin/keyctl" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$1" >> "$TEST_LOG"
+case "$1" in
+    get_persistent) echo 123 ;;
+    search) exit 1 ;;
+    padd)
+        cat > /dev/null
+        n="$(grep -c '^padd$' "$TEST_LOG")"
+        case "$TEST_PADD_MODE" in
+            quota-once) [ "$n" -gt 1 ] && { echo 4242; exit 0; } ;;
+            eperm) echo 'keyctl_add_key: Permission denied' >&2; exit 1 ;;
+        esac
+        echo 'keyctl_add_key: Disk quota exceeded' >&2; exit 1 ;;
+    timeout|unlink) : ;;
+    *) exit 99 ;;
+esac
+FAKE
+    cat > "$fakebin/op" <<'FAKE'
+#!/usr/bin/env bash
+while [ "$1" != -- ]; do shift; done
+shift
+export TEST_SECRET=canonical
+exec "$@"
+FAKE
+    # Fast retries: the real backoff only waits for the kernel to free bytes.
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$fakebin/sleep"
+    chmod +x "$fakebin/keyctl" "$fakebin/op" "$fakebin/sleep"
+}
+
+@test "runtime: a store that hits the quota once is retried and succeeds silently" {
+    make_store_fakes
+    run env PATH="$fakebin:$PATH" TEST_PADD_MODE=quota-once WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake \
+        bash "$RENDERED" bash -c 'printf "%s" "$TEST_SECRET"'
+    [ "$status" -eq 0 ]
+    [ "$output" = canonical ]
+    [ "$(grep -c '^padd$' "$TEST_LOG")" -eq 2 ]
+    grep -qx timeout "$TEST_LOG"
+}
+
+@test "runtime: a store that never fits is bounded, names keyctl's real error, and still runs the command" {
+    make_store_fakes
+    run env PATH="$fakebin:$PATH" TEST_PADD_MODE=quota WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake \
+        bash "$RENDERED" bash -c 'printf "%s" "$TEST_SECRET"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'failed to store the resolved Environment (keyctl: keyctl_add_key: Disk quota exceeded)'* ]]
+    [[ "$output" == *canonical ]]
+    [ "$(grep -c '^padd$' "$TEST_LOG")" -le 33 ]
+}
+
+@test "runtime: a non-quota store failure is reported verbatim and never triggers eviction" {
+    make_store_fakes
+    run env PATH="$fakebin:$PATH" TEST_PADD_MODE=eperm WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake \
+        bash "$RENDERED" bash -c 'printf "%s" "$TEST_SECRET"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'(keyctl: keyctl_add_key: Permission denied)'* ]]
+    [[ "$output" == *canonical ]]
+    [ "$(grep -c '^padd$' "$TEST_LOG")" -eq 1 ]
+    # The only unlinks allowed are the pre-resolve reap of expired keys,
+    # which the eperm path cannot add to.
+    local before_padd
+    before_padd="$(sed -n '/^padd$/q;p' "$TEST_LOG" | grep -c '^unlink$' || true)"
+    [ "$(grep -c '^unlink$' "$TEST_LOG" || true)" -eq "$before_padd" ]
+}
+
+@test "live: a miss unlinks this wrapper's expired entries from the persistent keyring" {
+    if ! command -v keyctl >/dev/null 2>&1; then
+        skip "keyctl (keyutils) not installed on this host"
+    fi
+    local fakebin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fakebin"
+    printf '#!/usr/bin/env bash\nwhile [ "$1" != -- ]; do shift; done\nshift\nexport TEST_SECRET=x\nexec "$@"\n' > "$fakebin/op"
+    chmod +x "$fakebin/op"
+    run keyctl session - bash -c '
+        set -e
+        pk="$(keyctl get_persistent @s)"
+        id="$(printf x | keyctl padd user "op-env-wrapper-cache:reaptest-$$:env:caller-v1:0" "$pk")" || exit 77
+        keyctl timeout "$id" 1
+        sleep 2
+        grep -q "^$(printf %08x "$id") .* expd " /proc/keys || exit 78
+        OP_ENV_WRAPPER_CACHE_TTL=2 WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake PATH="$1:$PATH" \
+            bash "$2" true
+        if keyctl rlist "$pk" | tr " " "\n" | grep -qx "$id"; then echo "still linked: $id"; exit 1; fi
+        echo reaped
+    ' _ "$fakebin" "$RENDERED"
+    if [ "$status" -eq 77 ]; then skip "no keyring quota left to seed a test key on this host"; fi
+    [ "$status" -eq 0 ]
+    [[ "$output" == *reaped ]]
 }
 
 # The exact baseline-diff logic from the wrapper template's stage-2
