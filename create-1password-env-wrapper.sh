@@ -390,22 +390,39 @@ case "\$(uname -s)" in
                 # there is no allowlist, because there is nothing for one to
                 # protect.
                 #
-                # Restored BEFORE the op resolve below, so the 1Password
+                # The caller's entries are collected into caller_env and
+                # applied with env(1) to every process this stage starts (the
+                # op resolve, the fingerprint, the final exec), NEVER exported
+                # into this shell. A shell \\\`export\\\` cannot represent every
+                # legal environment entry: an exported bash function
+                # (BASH_FUNC_name%%), a name containing a dot, or a name that
+                # collides with one of this script's readonly variables
+                # (IDENTIFIER, ...) each made \\\`export\\\` fail and killed the
+                # wrapper under set -e. env(1) accepts any NAME=value, and the
+                # wrapper's own variables can no longer be clobbered.
+                # Only the wrapper's own control knobs, and PATH (so op and
+                # helpers resolve exactly as the caller would), are imported
+                # into this shell.
+                #
+                # Applied BEFORE the op resolve below, so the 1Password
                 # Environment is diffed against an environment that already
                 # includes the caller's. A name defined on both sides therefore
                 # resolves to the 1PASSWORD value, which is the documented
                 # precedence.
                 #
-                # Three names are skipped, and none of them is the caller's:
-                # the decrypted token and the stage sentinel are this wrapper's
-                # own internals, and re-exporting either would leak the token
-                # or make a nested wrapper skip its stages. The third is the
-                # pointer to the capture itself.
+                # Skipped, none of them the caller's to set here: the
+                # decrypted token and the stage sentinel (re-exporting either
+                # would leak the token or make a nested wrapper skip its
+                # stages), the pointer to the capture itself, and the op
+                # settings this stage pins below (OP_CONNECT_HOST/TOKEN unset,
+                # OP_CACHE=false). An entry whose name starts with '-' is
+                # skipped because env(1) would read it as an option.
                 #
                 # HOME is skipped ONLY under OPENV_KEEP_PRIVILEGES, where the
                 # child stays root and stage 1 deliberately set HOME to root's
                 # own home so \`op run\` accepts its config directory. That is an
                 # op ownership constraint, not a privilege boundary.
+                caller_env=()
                 if [ -n "\${OPENV_CALLER_ENV_FILE:-}" ]; then
                     if [ -r "\$OPENV_CALLER_ENV_FILE" ]; then
                         while IFS= read -r -d "" _restore_kv; do
@@ -414,19 +431,28 @@ case "\$(uname -s)" in
                                 *) continue ;;
                             esac
                             _restore_n="\${_restore_kv%%=*}"
-                            [ -n "\$_restore_n" ] || continue
                             case "\$_restore_n" in
+                                ''|-*) continue ;;
                                 WRAPPER_STAGE|OP_SERVICE_ACCOUNT_TOKEN|OPENV_CALLER_ENV_FILE) continue ;;
+                                OP_CONNECT_HOST|OP_CONNECT_TOKEN|OP_CACHE) continue ;;
+                                PATH|OP_ENV_WRAPPER_DEBUG|OPENV_KEEP_PRIVILEGES)
+                                    export "\$_restore_n=\${_restore_kv#*=}" ;;
                             esac
-                            if [ "\${OPENV_KEEP_PRIVILEGES:-0}" = "1" ] && [ "\$_restore_n" = "HOME" ]; then
-                                continue
-                            fi
-                            export "\$_restore_n=\${_restore_kv#*=}"
+                            caller_env+=("\$_restore_kv")
                         done < "\$OPENV_CALLER_ENV_FILE"
                     fi
                     rm -f "\$OPENV_CALLER_ENV_FILE" 2>/dev/null || true
                     unset OPENV_CALLER_ENV_FILE
+                    if [ "\${OPENV_KEEP_PRIVILEGES:-0}" = "1" ]; then
+                        _kept=()
+                        for _restore_kv in "\${caller_env[@]}"; do
+                            case "\$_restore_kv" in HOME=*) ;; *) _kept+=("\$_restore_kv") ;; esac
+                        done
+                        caller_env=("\${_kept[@]}")
+                    fi
                 fi
+                # Runs a command with the caller's entries applied (see above).
+                caller_run() { env "\${caller_env[@]}" "\$@"; }
 
                 unset OP_CONNECT_HOST OP_CONNECT_TOKEN
                 # OP_CACHE=false (original hardening default, kept). op's cache
@@ -602,7 +628,7 @@ case "\$(uname -s)" in
                     # Bind hits to a sorted, NUL-framed digest of the exact
                     # baseline. Only the digest enters the key description;
                     # values remain in memory, never argv or a temporary file.
-                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t baseline_arr
+                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 "\${caller_env[@]}" | mapfile -d '' -t baseline_arr
                     if ! baseline_hash="\$(printf '%s\\0' "\${baseline_arr[@]}" | LC_ALL=C sort -z | sha256sum)"; then
                         err "TTL cache bypassed: could not fingerprint the caller environment"
                         persistent_kr=""
@@ -684,7 +710,7 @@ case "\$(uname -s)" in
                         done
                     fi
                     if [ "\${#assign[@]}" -gt 0 ]; then
-                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${caller_env[@]}" "\${assign[@]}" "\$@"
                     fi
 
                     # --- cache miss: resolve via an introspection target
@@ -706,7 +732,7 @@ case "\$(uname -s)" in
                         keyctl unlink "\$reap_id" "\$persistent_kr" >/dev/null 2>&1 || true
                     done || true
 
-                    op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t resolved_arr
+                    caller_run op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t resolved_arr
                     op_rc="\${PIPESTATUS[0]}"
                     if [ "\$op_rc" -eq 0 ]; then
                         assign=()
@@ -783,7 +809,7 @@ case "\$(uname -s)" in
                 # it ran). We never capture op/child output — it can carry secrets
                 # under --no-masking — so we branch on the exit code alone.
                 rc=0
-                op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
+                caller_run op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- \\
                     env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\$@" || rc=\$?
                 if [ "\$rc" -eq 9 ]; then
                     op_rate_limit_hint

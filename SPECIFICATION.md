@@ -380,12 +380,26 @@ All shell scripts in this repository SHALL:
        names, which is a stronger boundary than any list of names to
        refuse and needs no maintenance.
 
-       Exactly three names SHALL be skipped, and none is the caller's.
+       The restored entries SHALL be applied with `env(1)` to every
+       process Stage 2 starts (the `op` resolve, the cache
+       fingerprint, the final exec), and SHALL NOT be exported into
+       the wrapper's own shell. A shell `export` cannot represent
+       every legal environment entry: an exported bash function
+       (`BASH_FUNC_name%%`), a name containing a dot, or a name that
+       collides with one of the wrapper's readonly variables each made
+       `export` fail and abort the wrapper. Only `PATH` and the
+       wrapper's own control variables (`OP_ENV_WRAPPER_DEBUG`,
+       `OPENV_KEEP_PRIVILEGES`) SHALL be imported into its shell.
+
+       These names SHALL be skipped, and none is the caller's to set.
        `OP_SERVICE_ACCOUNT_TOKEN` and `WRAPPER_STAGE` are this
        wrapper's own internals: re-exporting the first would leak the
        token into the child, and the second would make a nested
-       wrapper skip its stages. The third is the pointer to the
-       capture. `HOME` SHALL additionally be held back under
+       wrapper skip its stages. The pointer to the capture is the
+       third. `OP_CONNECT_HOST`, `OP_CONNECT_TOKEN` and `OP_CACHE` are
+       pinned by Stage 2 (unset, unset, `false`) for the resolve and
+       the child. An entry whose name starts with `-` is skipped
+       because `env(1)` would read it as an option. `HOME` SHALL additionally be held back under
        `OPENV_KEEP_PRIVILEGES`, where the child stays root and Stage 1
        deliberately set `HOME` to root's own home so `op run` accepts
        its config directory; that is an `op` ownership constraint, not
@@ -1071,11 +1085,11 @@ Required properties:
   and
   `<IDENTIFIER_UPPERCASE>_1PASSWORD_ENVIRONMENT_ID=<env-id>`,
   where `<IDENTIFIER_UPPERCASE>` is the identifier in upper case
-  with any hyphens replaced by underscores. For the default
-  identifier `openbrain`, the entries are:
+  with any hyphens replaced by underscores. For the integration
+  test's default identifier `openv-e2e`, the entries are:
   ```
-  OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>
-  OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=<env-id>
+  OPENV_E2E_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<token>
+  OPENV_E2E_1PASSWORD_ENVIRONMENT_ID=<env-id>
   ```
 - When a fresh clone ships placeholder values (`PLACEHOLDER`),
   consumers SHALL treat those as "not yet configured" and refuse
@@ -1123,144 +1137,81 @@ end-to-end against real 1Password infrastructure. It is the
 authoritative proof that the repository satisfies the happy-path
 acceptance scenarios in this specification.
 
-The test SHALL use the identifier `openbrain` and assume that:
+The test SHALL be safe to run on a host that has live installs, and
+SHALL be run before any template change is rolled out. It SHALL
+therefore never touch an install it does not own:
 
-- on Linux, the group `openbrain` exists on the host (a Linux
-  *user* named `openbrain` is not required); on macOS, no group or
-  user precondition applies;
-- a 1Password service account exists with read access to a
-  1Password Environment (the Environment's name is irrelevant to
-  the wrapper; only its ID is used);
-- that Environment contains the variables
-  `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
-  `TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`;
-- the bootstrap inputs are reachable: either `.env.local` at the
-  repository root contains both
-  `OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=<real token>` and
-  `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=<env id>`, OR a previous
-  successful install left the platform-appropriate token store
-  populated and the installed wrapper on the host so the
-  encrypted-state fallback (see the `.env.local` section above)
-  can recover them;
-- the host provides `bats`, an Environments-aware `op` build
-  (`2.33.0-beta.02`+), and the BATS support libraries
-  `bats-support` and `bats-assert` (or equivalents) available on
-  `PATH` or via `load`. On Linux, the host additionally provides
-  `sudo` (GNU sudo, with env-preservation), `setpriv`, and the
-  systemd userspace (`systemctl`, `systemd-creds`). On macOS, the
-  host additionally provides the `security` CLI (always present).
+- It SHALL use its own reserved identifier, `openv-e2e` by default
+  (overridable via `OPENV_E2E_IDENTIFIER`, which SHALL end in
+  `-e2e`). Every artifact the installer writes is named after the
+  identifier (wrapper, sudoers fragment, credential, Keychain
+  service, cache keys), so the suite owns all of them.
+- On Linux it SHALL create the identifier's group if it is missing
+  (the installer never creates groups), and on teardown it SHALL
+  remove every artifact it created: the installed and rendered
+  wrapper, the sudoers fragment, the credential or Keychain entry,
+  its cache keys, and the group if the suite created it.
+- Before the first installer run it SHALL fingerprint every other
+  installed wrapper, sudoers fragment and credential, and SHALL fail
+  if any of them changed by the end of the run.
+- On Linux the install prefix SHALL be root-owned, because the
+  sudoers fragment grants passwordless root to the installed path.
 
-Test cases SHALL be platform-gated where they assert
-platform-specific filesystem state — Linux-only assertions (sudoers
-fragment, systemd-creds file, root:openbrain ownership, `sudo -u
-openbrain` invocations) SHALL be skipped on macOS via a Bats
-`skip` guard, and macOS-only assertions (Keychain entry,
-user-owned wrapper) SHALL be skipped on Linux. Assertions that
-apply to both platforms (rendered-wrapper canonical-source header,
-`.gitignore` entries, wrapper output for the test target) run on
-both.
+Credentials SHALL come from one of the following, and the suite
+SHALL NOT write them anywhere:
+
+1. `.env.local` entries named after the identifier
+   (`OPENV_E2E_1PASSWORD_SERVICE_ACCOUNT_TOKEN`,
+   `OPENV_E2E_1PASSWORD_ENVIRONMENT_ID` for the default), or
+2. `OPENV_E2E_SOURCE_IDENTIFIER=<existing identifier>`, which READS
+   that install's token and Environment ID (never modifying it).
+
+The Environment SHALL contain
+`TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+`TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`. The host SHALL
+provide `bats` (with `bats-support` and `bats-assert`) and an
+Environments-aware `op`. On Linux it additionally SHALL provide GNU
+`sudo`, `setpriv` and systemd (`systemd-creds`), and the invoking
+user SHALL be able to `sudo -n`. `keyctl` is needed for the cache
+tests, which are skipped without it.
+
+Assertions on platform-specific state SHALL be gated with a Bats
+`skip`: Linux-only (sudoers fragment, systemd credential,
+`root:<identifier>` ownership, the TTL cache) and macOS-only
+(Keychain entry, user-owned wrapper).
 
 ### Behavior
 
-The test file SHALL:
+The test SHALL cover, against the real installer, real `sudo` and
+real 1Password:
 
-1. In `setup_file` (or equivalent), load `.env.local` if present,
-   then resolve each bootstrap value (token and Environment ID)
-   in this order:
-   1. value from `.env.local` (if present and not `PLACEHOLDER`);
-   2. value from the platform-appropriate encrypted-state fallback:
-      - Linux: decrypt
-        `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
-        via `sudo systemd-creds decrypt --name=…` for the token;
-      - macOS: read `security find-generic-password -s openbrain
-        -a OP_SERVICE_ACCOUNT_TOKEN -w` for the token.
-      Both platforms grep
-      `${INSTALL_PREFIX}/with-openbrain-env.sh` for the Environment
-      ID.
-
-   If neither source yields a real value for either input, fail
-   fast with a clear error naming the missing input and
-   instructing the operator to populate `.env.local`. Pass the
-   resolved token (as `OP_SERVICE_ACCOUNT_TOKEN`) and Environment
-   ID (as `ONEPASSWORD_ENVIRONMENT_ID`) into each installer
-   invocation only — not as global test-process env vars.
-2. Invoke the installer with `IDENTIFIER=openbrain` and
-   `ONEPASSWORD_ENVIRONMENT_ID` set, capturing stdout, stderr, and
-   exit status. On Linux the invocation is under `sudo -E`; on
-   macOS the invocation is direct (no `sudo`). Assert exit status
-   `0`, that the installer reported installing
-   `${INSTALL_PREFIX}/with-openbrain-env.sh`, and that the
-   installer output contains neither the raw token value nor the
-   placeholder string.
-3. Assert that `${INSTALL_PREFIX}/with-openbrain-env.sh` exists,
-   with the platform-appropriate ownership and mode:
-   - Linux: owned by `root:openbrain`, mode `0750`.
-   - macOS: owned by the invoking user, mode `0755`.
-4. Assert that the platform-appropriate token store is populated:
-   - Linux: the encrypted credential file
-     `/etc/credstore.encrypted/1password-env-wrapper-openbrain`
-     exists, is owned by `root:root` with mode `0600`, AND no
-     plaintext-token file exists anywhere under
-     `/etc/onepassword-env-wrapper/` (the directory itself MUST
-     NOT exist; this is the "no plaintext on disk" invariant).
-   - macOS: `security find-generic-password -s openbrain -a
-     OP_SERVICE_ACCOUNT_TOKEN -w` returns a non-empty string.
-5. Assert that `.gitignore` at the repository root contains the
-   patterns `/with-*-env.sh` and `.env.local` (both platforms).
-6. **Linux only**: assert that the sudoers fragment
-   `/etc/sudoers.d/with-openbrain-env` exists, is owned by
-   `root:root`, has mode `0440`, and contains the expected
-   `%openbrain ALL=(root) NOPASSWD: SETENV: …` line. Skip on
-   macOS.
-7. Run the installed wrapper against `print-test-env-vars.sh`.
-   - Linux: run as the `openbrain` user via `sudo -u openbrain`.
-     Because the repository checkout MAY sit under a path that the
-     `openbrain` user cannot traverse, the test SHALL stage an
-     executable copy of `print-test-env-vars.sh` at a
-     world-readable path (for example
-     `/tmp/print-test-env-vars.<random>.sh`, `chmod 0755`).
-   - macOS: run as the BATS-invoking user (no `sudo -u`); the
-     stage-and-chmod step is unnecessary but harmless.
-   On both platforms, assert:
-   - exit status `0`;
-   - the output contains the lines
-     `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
-     `TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`;
-   - the output does **not** contain any line starting with
-     `TEST_CREDENTIAL_FROM_VAULT=` (this guards against
-     regressing back to the vault-enumeration model);
-   - the output is sorted by variable name;
-   - the output contains no `OP_SERVICE_ACCOUNT_TOKEN=` line.
-8. Run the installed wrapper with the command `env` (as the
-   `openbrain` user on Linux, as the BATS-invoking user on macOS);
-   assert `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` appears in
-   the output and `OP_SERVICE_ACCOUNT_TOKEN` does not.
-9. Run the installed wrapper with the command
-   `printenv OP_SERVICE_ACCOUNT_TOKEN` (same user-selection rule
-   as 8) and assert the wrapper exit status is `1` (variable
-   unset), confirming that the secret-zero token is not inherited
-   by the child.
-10. Run the **rendered** build artifact at the repository root
-    (`./with-openbrain-env.sh`) directly as the BATS-invoking user
-    (with the staged `print-test-env-vars.sh` as the argument) and
-    assert it succeeds and produces
-    `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE`. On Linux this
-    proves stage-0 self-escalation via the sudoers fragment works
-    end-to-end for the operator who just ran the installer (whose
-    user was added to the `openbrain` group in installer step 10);
-    on macOS this proves the rendered artifact and installed copy
-    behave identically (no escalation involved).
-11. Assert the rendered build artifact at the repository root
-    (`./with-openbrain-env.sh`) is byte-identical to the installed
-    wrapper at `${INSTALL_PREFIX}/with-openbrain-env.sh`
-    (`cmp` exits `0`). This holds on both platforms and supports
-    the cross-platform byte-identicality invariant.
-
-The test SHALL be idempotent on either platform: rerunning it SHALL
-succeed whether or not a prior install exists. The test SHOULD NOT
-remove the installed wrapper, the platform-appropriate token store,
-the sudoers fragment (Linux), or the group membership (Linux) on
-teardown; cleanup is an operator concern.
+1. The installer refuses a missing token and a malformed identifier,
+   succeeds with valid inputs, is idempotent, and never prints the
+   token.
+2. Installed ownership and mode (Linux `root:<identifier>` `0750`,
+   macOS the invoking user `0755`); the credential (`root:root`
+   `0600`) or Keychain entry; the sudoers fragment (`root:root`
+   `0440`, `%<identifier> ALL=(root) NOPASSWD: SETENV: <path>`); no
+   plaintext-token directory; `.gitignore` entries; the
+   canonical-source header; the rendered artifact byte-identical to
+   the installed wrapper.
+3. The wrapper, run as the invoking operator (on Linux through
+   `sudo -u <self>` so the fresh group membership applies), injects
+   the Environment into `print-test-env-vars.sh` (sorted, no vault
+   items, no token), and the rendered artifact works directly for
+   the installing operator.
+4. Caller variables reach the command, and 1Password wins a name
+   collision. Entries a shell cannot export (an exported bash
+   function, a dotted name, a readonly-name collision) also reach
+   the command. The command's exit status is propagated. The wrapped
+   stdout is byte-identical with and without stderr merged, on both a
+   cache miss and a cache hit.
+5. Linux TTL cache, using an `op` shim that fails once a block-flag
+   file exists: a warm hit makes zero `op` calls and still replays
+   the Environment; a different caller environment is a miss;
+   `OP_ENV_WRAPPER_CACHE_TTL=0` always calls `op`; a miss unlinks
+   expired cache entries from the persistent keyring.
+6. Last, that no install outside the suite's identifier changed.
 
 ### Invocation
 
