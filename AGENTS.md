@@ -375,65 +375,32 @@ template fix:
   Linux-side cache fix, and is out of scope for a Linux keyring fix
   unless the PR says otherwise.
 
-## Running the integration test
+## Running the integration test (the pre-rollout gate)
 
-**Warning — this can silently reinstall a live production wrapper.**
-`test/integration.bats` defaults `INSTALL_PREFIX` to `/usr/local/bin`
-on Linux — the same location real wrappers are actually installed
-to. If you run this suite on a host that also runs a live wrapper
-for `IDENTIFIER=openbrain`, it reinstalls that production wrapper
-from whatever is in *your current working tree* — including a dirty
-or unmerged branch — with no confirmation and no log line calling it
-out. This already happened once (see
-[#12](https://github.com/thewoolleyman/1password-env-wrapper/issues/12)):
-running the suite once to satisfy "tests must stay green" before a
-PR quietly deployed that PR's own not-yet-merged code to production,
-and the resulting mismatch (installed file older than the PR it was
-supposedly testing, missing a commit that landed after) was initially
-mistaken for something else entirely before the actual cause —
-the test run — was traced down. Until #12 is fixed, treat
-`bats test/integration.bats` as a deploy action on any host that also
-runs a real installed wrapper for the identifier under test, not as a
-side-effect-free test run — check whether that identifier is live on
-the host you're about to run it on first.
+`test/integration.bats` is the end-to-end gate. Run it before rolling out
+any template change. It is safe on a host with live wrappers: it installs
+under its own reserved identifier (`openv-e2e`), creates and removes its
+own group, wrapper, sudoers fragment, credential and cache keys, and fails
+if any other installed wrapper, sudoers fragment or credential changed
+during the run. Full contract: SPECIFICATION.md § "Integration Test".
 
-The repository ships a Bats integration test at
-`test/integration.bats` that drives the installer against real
-1Password infrastructure, with platform-specific assertions gated
-by `uname`. To run it:
+It needs `bats`, `bats-support`, `bats-assert`, an Environments-aware
+`op`, and on Linux `sudo -n`, `setpriv`, systemd and (for the cache tests)
+`keyctl`. It also needs credentials for an Environment that contains
+`TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
+`TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`, from either:
 
-1. Make sure the host has `bats`, `bats-support`, `bats-assert`,
-   `op`, `jq`. On Linux, additionally `sudo` and the Linux group
-   `openbrain` (a Linux *user* named `openbrain` is no longer
-   required). On macOS, no extra preconditions.
-2. Populate the gitignored bootstrap secret file `.env.local` at the
-   repository root with a real service account token AND the
-   Environment ID. Starting from placeholders:
+- `.env.local` (gitignored):
+  `OPENV_E2E_1PASSWORD_SERVICE_ACCOUNT_TOKEN=...` and
+  `OPENV_E2E_1PASSWORD_ENVIRONMENT_ID=...`, or
+- an existing install whose Environment has those variables. The suite
+  reads that install's token and Environment ID and never modifies it:
 
-   ```sh
-   {
-     printf 'OPENBRAIN_1PASSWORD_SERVICE_ACCOUNT_TOKEN=PLACEHOLDER\n'
-     printf 'OPENBRAIN_1PASSWORD_ENVIRONMENT_ID=PLACEHOLDER\n'
-   } > .env.local
-   # then edit .env.local and replace each PLACEHOLDER with the real value
-   ```
+  ```sh
+  OPENV_E2E_SOURCE_IDENTIFIER=<identifier> bats test/integration.bats
+  ```
 
-   The test will fail fast if either entry is missing or still
-   reads `PLACEHOLDER` and no encrypted-state fallback is reachable.
-3. Make sure the 1Password Environment identified by
-   `OPENBRAIN_1PASSWORD_ENVIRONMENT_ID` contains
-   `TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE` and
-   `TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2`.
-4. From the repository root, run:
-
-   ```sh
-   bats test/integration.bats
-   ```
-
-   On Linux, the test invokes `sudo` itself; the outer `bats`
-   process does not need to run as root, but the session MUST be
-   able to escalate via `sudo`. On macOS, the test runs entirely
-   as the invoking user — no `sudo` at all.
+`test/wrapper-render.bats` is the fast unit suite (no 1Password, no root).
 
 ## Example shell interaction (Linux)
 
