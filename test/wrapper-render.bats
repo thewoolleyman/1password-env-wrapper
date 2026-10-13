@@ -118,8 +118,8 @@ setup_file() {
 }
 
 @test "stage-0 already-root re-exec drops the env -- separator (bug-fix 1)" {
-    grep -Fq 'exec env WRAPPER_STAGE=1 "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
-    ! grep -Fq 'exec env WRAPPER_STAGE=1 -- "$INSTALLED_WRAPPER"' "$RENDERED"
+    grep -Fq 'exec env WRAPPER_STAGE=1 OPENV_CALLER_ENV_FILE="$caller_env_file" "$INSTALLED_WRAPPER" "$@"' "$RENDERED"
+    ! grep -Eq 'exec env WRAPPER_STAGE=1 .* -- ' "$RENDERED"
 }
 
 @test "sudo self-escalation keeps its own -- separator" {

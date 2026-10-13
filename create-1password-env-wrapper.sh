@@ -241,17 +241,6 @@ case "\$(uname -s)" in
                 if [ ! -e "\$INSTALLED_WRAPPER" ]; then
                     die "installed wrapper not found at \$INSTALLED_WRAPPER (run create-1password-env-wrapper.sh first)"
                 fi
-                if [ "\$(id -u)" -eq 0 ]; then
-                    # Already root; jump straight to stage 1 without sudo.
-                    # No \`--\` after the assignment: uutils \`env\` (and POSIX
-                    # \`env\`) reject a GNU-style \`--\` separator following
-                    # NAME=value operands; the assignment list already ends at
-                    # the first non-assignment word.
-                    exec env WRAPPER_STAGE=1 "\$INSTALLED_WRAPPER" "\$@"
-                fi
-                if ! sudo_path="\$(command -v sudo)"; then
-                    die "sudo not found on PATH; required to escalate for credential decryption"
-                fi
                 # Thread OP_ENV_WRAPPER_CACHE_TTL through explicitly: sudo's
                 # default env_reset strips the caller's ambient environment
                 # here (the sudoers SETENV tag permits an override, it does
@@ -301,6 +290,28 @@ case "\$(uname -s)" in
                         rm -f "\$caller_env_file" 2>/dev/null || true
                         caller_env_file=""
                     fi
+                fi
+                if [ "\$(id -u)" -eq 0 ]; then
+                    # External sudo reaches stage 0 as root. Capture its
+                    # caller environment too: stage 1 still uses env -i.
+                    # If stage 1 will drop uid, that invoker must be able to
+                    # read the private capture created by root here.
+                    if [ -n "\$caller_env_file" ] && [ "\${OPENV_KEEP_PRIVILEGES:-0}" != "1" ]; then
+                        if [ -z "\${SUDO_UID:-}" ] || [ -z "\${SUDO_GID:-}" ]; then
+                            rm -f "\$caller_env_file" 2>/dev/null || true
+                            die "stage 0 expected SUDO_UID and SUDO_GID for the invoker"
+                        fi
+                        if ! chown "\$SUDO_UID:\$SUDO_GID" "\$caller_env_file"; then
+                            rm -f "\$caller_env_file" 2>/dev/null || true
+                            die "could not make the caller environment readable by the invoker"
+                        fi
+                    fi
+                    # Keep env's assignment list free of a GNU-only --.
+                    exec env WRAPPER_STAGE=1 OPENV_CALLER_ENV_FILE="\$caller_env_file" "\$INSTALLED_WRAPPER" "\$@"
+                fi
+                if ! sudo_path="\$(command -v sudo)"; then
+                    rm -f "\$caller_env_file" 2>/dev/null || true
+                    die "sudo not found on PATH; required to escalate for credential decryption"
                 fi
                 exec "\$sudo_path" -n WRAPPER_STAGE=1 OP_ENV_WRAPPER_CACHE_TTL="\${OP_ENV_WRAPPER_CACHE_TTL:-}" OPENV_CALLER_ENV_FILE="\$caller_env_file" -- "\$INSTALLED_WRAPPER" "\$@"
                 ;;
