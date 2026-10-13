@@ -476,6 +476,26 @@ run_wrapper_separated() { run --separate-stderr as_member "$INSTALLED_WRAPPER" "
     assert_line "from-caller TEST_VALUE"
 }
 
+@test "privileged root invocation preserves caller variables and root HOME" {
+    skip_unless_linux
+    ensure_installed
+    run env OPENV_KEEP_PRIVILEGES=1 E2E_CALLER_VAR=from-caller \
+        sudo -n -E -- "$INSTALLED_WRAPPER" \
+        bash -c 'printf "%s %s %s\n" "$E2E_CALLER_VAR" "$(id -u)" "$HOME"'
+    assert_success
+    assert_line "from-caller 0 $(getent passwd 0 | cut -d: -f6)"
+}
+
+@test "external sudo without keep-privileges preserves caller variables after dropping uid" {
+    skip_unless_linux
+    ensure_installed
+    run env -u OPENV_KEEP_PRIVILEGES E2E_CALLER_VAR=from-caller \
+        sudo -n -E -- "$INSTALLED_WRAPPER" \
+        bash -c 'printf "%s %s\n" "$E2E_CALLER_VAR" "$(id -u)"'
+    assert_success
+    assert_line "from-caller $(id -u)"
+}
+
 @test "caller entries a shell cannot export still reach the command" {
     ensure_installed
     # An exported bash function, a dotted name and a readonly-name collision
