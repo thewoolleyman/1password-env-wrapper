@@ -548,18 +548,23 @@ run_wrapper_separated() { run --separate-stderr as_member "$INSTALLED_WRAPPER" "
     assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2"
 }
 
-@test "cache: a different caller environment is a miss, never another caller's entry (Linux)" {
+@test "cache: a different caller environment is a warm hit with every value (Linux)" {
+    # The regression this guards: a caller-bound key made every call with a
+    # fresh TRACEPARENT / session ID a miss and a full op run. The entry is
+    # per Environment, and a bare caller must still get every value.
     skip_unless_linux
     skip_unless_keyctl
     ensure_installed
     local caller=(PATH="$SHIM_DIR:$PATH")
-    run_wrapper "${caller[@]}" E2E_CACHE_PROBE="$$-a-$RANDOM" true
+    run_wrapper "${caller[@]}" E2E_CACHE_PROBE="$$-a-$RANDOM" TRACEPARENT="00-$$-a-01" true
     assert_success
     touch "$OP_BLOCK_FLAG"
-    run_wrapper "${caller[@]}" E2E_CACHE_PROBE="$$-b-$RANDOM" true
+    run_wrapper "${caller[@]}" E2E_CACHE_PROBE="$$-b-$RANDOM" TRACEPARENT="00-$$-b-01" "$STAGED_TARGET"
     rm -f "$OP_BLOCK_FLAG"
-    assert_failure 97
-    assert_output --partial "op was called while blocked"
+    assert_success
+    refute_output --partial "op was called while blocked"
+    assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT=TEST_VALUE"
+    assert_line "TEST_CREDENTIAL_FROM_ENVIRONMENT_2=TEST_VALUE_2"
 }
 
 @test "cache: OP_ENV_WRAPPER_CACHE_TTL=0 always calls op (Linux)" {
@@ -586,6 +591,9 @@ run_wrapper_separated() { run --separate-stderr as_member "$INSTALLED_WRAPPER" "
     [ -n "$id" ] || skip "could not seed a keyring entry (quota?)"
     sleep 2
     grep -q "^$(printf %08x "$id") .* expd " /proc/keys
+    # Force a miss: drop this suite's own live entry, so the reap runs.
+    keyctl session - bash -c 'pk="$(keyctl get_persistent @s)" && k="$(keyctl search "$pk" user "op-env-wrapper-cache:$1:$2:env-v2")" && keyctl unlink "$k" "$pk"' \
+        _ "$E2E_ID" "$BOOTSTRAP_ENV_ID" >/dev/null 2>&1 || true
     run_wrapper E2E_CACHE_PROBE="$$-reap-$RANDOM" true
     assert_success
     run keyctl session - bash -c 'keyctl rlist "$(keyctl get_persistent @s)"'

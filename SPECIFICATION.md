@@ -895,19 +895,38 @@ entirely.
   treated as a miss rather than being handed to `env`, where a
   bare non-assignment token would be misread as the start of the
   command rather than an assignment.
-- Cached diffs SHALL be bound to the exact caller baseline from which
-  they were derived. The cache key includes a versioned SHA-256 digest
-  of the sorted, NUL-delimited baseline (excluding the token and stage
-  sentinel). A nested caller that already holds Environment values
-  therefore cannot populate an incomplete cache entry for a bare caller.
-  Fingerprinting SHALL NOT put baseline values in argv, logs, or temporary
-  files. Its failure falls back to the normal uncached path with a
-  diagnostic. Old unbound entries are ignored. Distinct caller environments
-  may occupy distinct entries until their ordinary TTL expires; changing
-  unrelated ambient variables may cause another miss, but identical
-  baselines retain warm hits.
-- **Keyring housekeeping.** Because entries fan out per caller baseline,
-  the wrapper SHALL manage its own share of the uid's
+- A cache entry SHALL be independent of the caller. There is exactly one
+  entry per `IDENTIFIER` + Environment ID (per uid, since the keyring is
+  per uid), with the versioned description
+  `op-env-wrapper-cache:<IDENTIFIER>:<ENVIRONMENT_ID>:env-v2`. To make that
+  safe, the cache-populating resolve SHALL run against a **fixed
+  baseline**, not the caller's environment: every exported variable is
+  removed except `HOME` (op's config directory; constant per uid) and the
+  token, `PATH` is pinned to a fixed system value, and `OP_CACHE=false`.
+  The `op` binary itself is located with the caller's `PATH` first. The
+  diff of op's output against that same fixed baseline is exactly what the
+  Environment injects, whoever called. This keeps issue #17's guarantee (a
+  nested caller that already carries every Environment value cannot cache
+  a near-empty diff for a bare caller) without binding entries to the
+  caller. The one blind spot is an Environment variable named `HOME`,
+  `PATH` or `OP_CACHE` whose value is byte-identical to the fixed
+  baseline's; it is not cached and so not applied on a hit.
+  - History: an earlier design (`caller-v1:`) bound each entry to a
+    SHA-256 of the caller's entire environment. On a real host that made
+    nearly every call miss, because per-invocation variables
+    (`TRACEPARENT`, terminal and agent session IDs, `PWD`, `SHLVL`, ...)
+    differ on almost every call. It was measured at a hit rate of 33-42%,
+    with ~11 CPU-seconds per miss. Older entry formats are never replayed.
+- Concurrent misses SHALL share one resolve. After a miss, the wrapper takes
+  an exclusive `flock` (waiting at most 90 s) on
+  `/run/user/<uid>/op-env-wrapper-cache-<IDENTIFIER>-<ENVIRONMENT_ID>.lock`,
+  then checks the cache again before resolving. The lock file holds no data.
+  If the runtime directory is missing, not owned by the uid, or not
+  writable, if `flock` is missing, or if the wait times out, the wrapper
+  resolves without the lock, exactly as it would otherwise. The lock
+  descriptor SHALL be closed before every `exec` and SHALL NOT be inherited
+  by `op`, so neither op nor the real command holds the lock.
+- **Keyring housekeeping.** The wrapper SHALL manage its own share of the uid's
   `kernel.keys.maxbytes`/`maxkeys` quota, because the kernel was measured
   NOT to reap expired entries that are still linked from the persistent
   keyring (they stayed `expd`, keeping their bytes, well past `gc_delay`)
@@ -919,8 +938,13 @@ entirely.
   describe` refuses expired keys. If `/proc/keys` is unreadable,
   housekeeping is a no-op.
   - On every cache miss, before the resolve, it SHALL unlink every such
-    entry that has expired. The kernel frees an unlinked key's bytes
-    asynchronously (measured: not freed immediately after unlink, freed
+    entry that has expired, and every such entry with no expiry (`perm`).
+    A wrapper entry without a timeout can only come from a `keyctl
+    timeout` that failed after the store, and it would otherwise be
+    replayed forever, even across a token or Environment change. For the
+    same reason, if `keyctl timeout` fails right after a store, the
+    wrapper SHALL unlink the entry it just stored. The kernel frees an
+    unlinked key's bytes asynchronously (measured: not freed immediately after unlink, freed
     ~50 ms later), so reaping before the `op run` gives the kernel time
     to free them before the store.
   - If `keyctl padd` fails with a quota error, it SHALL evict such live
@@ -933,15 +957,13 @@ entirely.
 - On a cache **miss**, Stage 2 SHALL resolve the Environment via
   **exactly one** `op run --no-masking --environment <ID> -- env -u
   OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0` call whose target is
-  an introspection command (`env -0`), not the real command, so the
-  wrapper can diff the result against a pre-op baseline snapshot of
-  its own environment and learn which variables op changed relative to
-  that baseline. This does not identify Environment membership: inherited
-  values may already be equal. Only that caller-bound diff is written to
-  the cache; the real
-  command is then launched directly by the wrapper itself (never as
-  a child of `op`) with the full resolved set applied on top of the
-  current environment. A cache miss therefore costs the same single
+  an introspection command (`env -0`), not the real command. That call
+  runs under the fixed baseline described above, so diffing its output
+  against the fixed baseline yields the Environment's variables. Only
+  that diff is written to the cache. The real command is then launched
+  directly by the wrapper itself (never as a child of `op`) with the
+  diff applied on top of the caller's environment, exactly as a hit
+  does. A cache miss therefore costs the same single
   `op run` call the uncached path costs today, for every Environment
   — caching never doubles op invocations, regardless of whether any
   value contains a literal newline.
