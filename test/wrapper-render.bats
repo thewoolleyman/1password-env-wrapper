@@ -429,7 +429,7 @@ default_drop_branch() {
     # later, separate invocation as the exact same uid. get_persistent
     # both creates-or-fetches a uid-scoped keyring AND links it into the
     # calling process's session, so reads actually work across invocations.
-    grep -Fq 'cache_desc="op-env-wrapper-cache:${IDENTIFIER}:${ONEPASSWORD_ENVIRONMENT_ID}:caller-v1:${baseline_hash%% *}"' "$RENDERED"
+    grep -Fq 'cache_desc="op-env-wrapper-cache:${IDENTIFIER}:${ONEPASSWORD_ENVIRONMENT_ID}:env-v2"' "$RENDERED"
     grep -Fq 'persistent_kr="$(keyctl get_persistent @s 2>/dev/null)"' "$RENDERED"
     grep -Fq 'keyctl search "$persistent_kr" user "$cache_desc"' "$RENDERED"
     grep -Fq 'keyctl padd user "$cache_desc" "$persistent_kr"' "$RENDERED"
@@ -441,7 +441,7 @@ default_drop_branch() {
     grep -Fq "keyctl pipe \"\$key_id\" 2>/dev/null | mapfile -d '' -t assign" "$RENDERED"
     grep -Fq "keyctl padd user \"\$cache_desc\" \"\$persistent_kr\"" "$RENDERED"
     grep -Fq "printf '%s" "$RENDERED"
-    grep -Fq "env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 \"\${caller_env[@]}\" | mapfile -d '' -t baseline_arr" "$RENDERED"
+    grep -Fq "clean_run env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 9>&- | mapfile -d '' -t baseline_arr" "$RENDERED"
 }
 
 @test "a cache-hit replay entry is sanity-checked for '=' before being trusted as an env operand" {
@@ -458,11 +458,11 @@ default_drop_branch() {
     # launch — both bypass op entirely for the child, so both must repeat
     # the same -u strip the uncached op-run path gets from op's own env -u.
     grep -qF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${caller_env[@]}" "${assign[@]}" "$@"' "$RENDERED"
-    grep -qF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${assign[@]}" "$@"' "$RENDERED"
+    grep -qF 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${caller_env[@]}" "${injected[@]}" "$@"' "$RENDERED"
 }
 
 @test "a cache miss resolves via an introspection target (env -0), never the real command, under op" {
-    grep -Fq 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED"
+    grep -Fq 'clean_run "$op_bin" run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED"
 }
 
 @test "op's exit status on the cache-populate resolve is read via PIPESTATUS, not a bare \$?" {
@@ -480,7 +480,8 @@ default_drop_branch() {
     local fakebin="$BATS_TEST_TMPDIR/bin"
     mkdir -p "$fakebin" "$BATS_TEST_TMPDIR/cache"
     export TEST_CACHE_DIR="$BATS_TEST_TMPDIR/cache"
-    export TEST_OP_CALLS="$BATS_TEST_TMPDIR/op-calls"
+    local op_calls="$BATS_TEST_TMPDIR/op-calls"
+    : > "$op_calls"
     cat > "$fakebin/keyctl" <<'FAKE'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -494,53 +495,93 @@ case "$1" in
     *) exit 99 ;;
 esac
 FAKE
-    cat > "$fakebin/op" <<'FAKE'
+    # op runs against the fixed baseline, so it sees none of the caller's
+    # variables; the calls log path is baked in for that reason.
+    cat > "$fakebin/op" <<FAKE
 #!/usr/bin/env bash
 set -Eeuo pipefail
-printf 'resolve\n' >> "$TEST_OP_CALLS"
-while [ "$1" != -- ]; do shift; done
+printf 'resolve\n' >> "$op_calls"
+if [ -n "\${CALLER_ONLY+x}" ] || [ -n "\${TEST_SECRET+x}" ]; then
+    echo "op saw the caller's environment" >&2
+    exit 3
+fi
+while [ "\$1" != -- ]; do shift; done
 shift
-export TEST_SECRET=canonical TEST_PEM=$'line1\nline2==' TEST_EMPTY=''
-# Even a fully inherited Environment produces an incidental nonempty diff.
-export OP_RESOLVED=1
-exec "$@"
+export TEST_SECRET=canonical TEST_PEM=\$'line1\nline2==' TEST_EMPTY=''
+exec "\$@"
 FAKE
     chmod +x "$fakebin/keyctl" "$fakebin/op"
     local probe='test "$TEST_SECRET" = canonical && test "$TEST_PEM" = "$(printf "line1\nline2==")" && test "${TEST_EMPTY+x}" = x && test -z "$TEST_EMPTY" && test -z "${OP_SERVICE_ACCOUNT_TOKEN+x}" && test -z "${WRAPPER_STAGE+x}" && printf "%s" "$CALLER_ONLY"'
+    # A nested caller that already carries every Environment value populates
+    # the cache first (issue #17's failure mode).
     run env PATH="$fakebin:$PATH" WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake \
         CALLER_ONLY=first TEST_SECRET=canonical TEST_PEM=$'line1\nline2==' TEST_EMPTY='' \
         bash "$RENDERED" bash -c "$probe"
     [ "$status" -eq 0 ]
     [ "$output" = first ]
+    [ "$(wc -l < "$op_calls")" -eq 1 ]
+    # A bare caller with a different environment still gets every value,
+    # from a warm hit: the entry does not depend on who populated it.
     run env -u TEST_SECRET -u TEST_PEM -u TEST_EMPTY PATH="$fakebin:$PATH" \
         WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake CALLER_ONLY=second \
+        TRACEPARENT=00-unique-per-call-01 \
         bash "$RENDERED" bash -c "$probe"
     [ "$status" -eq 0 ]
     [ "$output" = second ]
-    # Identical bare caller still gets a genuine warm hit (no extra op call).
-    local calls
-    calls="$(wc -l < "$TEST_OP_CALLS")"
-    run env -u TEST_SECRET -u TEST_PEM -u TEST_EMPTY PATH="$fakebin:$PATH" \
-        WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake CALLER_ONLY=second \
-        bash "$RENDERED" bash -c "$probe"
-    [ "$status" -eq 0 ]
-    [ "$output" = second ]
-    [ "$(wc -l < "$TEST_OP_CALLS")" -eq "$calls" ]
-    # Equal-to-canonical and different-from-canonical baselines both work.
+    # Conflicting caller values lose to 1Password, also from the hit.
     run env PATH="$fakebin:$PATH" WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake \
         CALLER_ONLY=third TEST_SECRET=wrong TEST_PEM=wrong TEST_EMPTY=wrong \
         bash "$RENDERED" bash -c "$probe"
     [ "$status" -eq 0 ]
     [ "$output" = third ]
-    # A failed fingerprint must resolve normally, never replay another entry.
-    printf '#!/usr/bin/env bash\nexit 1\n' > "$fakebin/sha256sum"
-    chmod +x "$fakebin/sha256sum"
-    run env -u TEST_SECRET -u TEST_PEM -u TEST_EMPTY PATH="$fakebin:$PATH" \
-        WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake CALLER_ONLY=fallback \
-        bash "$RENDERED" bash -c "$probe"
-    [ "$status" -eq 0 ]
-    [[ "$output" == *'could not fingerprint the caller environment'* ]]
-    [[ "$output" == *fallback ]]
+    # Three different callers, one op run.
+    [ "$(wc -l < "$op_calls")" -eq 1 ]
+}
+
+@test "runtime: concurrent misses share one op run via the per-Environment lock" {
+    [ -d "/run/user/$EUID" ] && [ -w "/run/user/$EUID" ] || skip "no private runtime dir for this uid"
+    command -v flock >/dev/null 2>&1 || skip "flock not installed"
+    local fakebin="$BATS_TEST_TMPDIR/bin"
+    mkdir -p "$fakebin" "$BATS_TEST_TMPDIR/cache"
+    export TEST_CACHE_DIR="$BATS_TEST_TMPDIR/cache"
+    local op_calls="$BATS_TEST_TMPDIR/op-calls"
+    : > "$op_calls"
+    cat > "$fakebin/keyctl" <<'FAKE'
+#!/usr/bin/env bash
+digest() { printf '%s' "$1" | sha256sum | cut -d ' ' -f1; }
+case "$1" in
+    get_persistent) echo 123 ;;
+    search) key="$(digest "$4")"; [ -f "$TEST_CACHE_DIR/$key" ] || exit 1; echo "$key" ;;
+    padd) key="$(digest "$3")"; cat > "$TEST_CACHE_DIR/$key.tmp"; mv "$TEST_CACHE_DIR/$key.tmp" "$TEST_CACHE_DIR/$key"; echo "$key" ;;
+    pipe) cat "$TEST_CACHE_DIR/$2" ;;
+    *) : ;;
+esac
+FAKE
+    cat > "$fakebin/op" <<FAKE
+#!/usr/bin/env bash
+printf 'resolve\n' >> "$op_calls"
+sleep 1
+while [ "\$1" != -- ]; do shift; done
+shift
+export TEST_SECRET=canonical
+exec "\$@"
+FAKE
+    chmod +x "$fakebin/keyctl" "$fakebin/op"
+    # A unique Environment ID keeps this test's lock file to itself.
+    local wrapper="$BATS_TEST_TMPDIR/with-lock-env.sh"
+    sed "s/^readonly ONEPASSWORD_ENVIRONMENT_ID=.*/readonly ONEPASSWORD_ENVIRONMENT_ID='locktest$$'/" "$RENDERED" > "$wrapper"
+    grep -q "locktest$$" "$wrapper"
+    local i
+    for i in 1 2 3 4; do
+        env PATH="$fakebin:$PATH" WRAPPER_STAGE=2 OP_SERVICE_ACCOUNT_TOKEN=fake CALLER_ONLY="c$i" \
+            bash "$wrapper" printenv TEST_SECRET > "$BATS_TEST_TMPDIR/out$i" 2>&1 &
+    done
+    wait
+    rm -f "/run/user/$EUID/op-env-wrapper-cache-"*"-locktest$$.lock"
+    for i in 1 2 3 4; do
+        [ "$(cat "$BATS_TEST_TMPDIR/out$i")" = canonical ]
+    done
+    [ "$(wc -l < "$op_calls")" -eq 1 ]
 }
 
 # ---------------------------------------------------------------------------
@@ -573,7 +614,8 @@ load_cache_select() {
 KEYS
     run cache_select expired < "$fixture"
     [ "$status" -eq 0 ]
-    [ "$output" = 10 ]
+    # A wrapper key with no expiry (perm) never had its TTL set: reap it.
+    [ "$output" = "$(printf '10\n17')" ]
     run cache_select live < "$fixture"
     [ "$status" -eq 0 ]
     [ "$output" = "$(printf '33 11\n240 12\n3600 13')" ]
@@ -588,7 +630,7 @@ KEYS
     # Reaping sits after the hit check and before the single op resolve.
     local reap op hit
     reap="$(grep -n 'cache_select expired < /proc/keys' "$RENDERED" | cut -d: -f1)"
-    op="$(grep -n 'op run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED" | cut -d: -f1)"
+    op="$(grep -n 'clean_run "$op_bin" run --no-masking --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0' "$RENDERED" | cut -d: -f1)"
     hit="$(grep -n 'exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "${caller_env\[@\]}" "${assign\[@\]}" "$@"' "$RENDERED" | head -1 | cut -d: -f1)"
     [ "$hit" -lt "$reap" ]
     [ "$reap" -lt "$op" ]
@@ -888,8 +930,7 @@ EOF
         keyctl session - bash -c '
             set -e
             persistent_kr="$(keyctl get_persistent @s)"
-            baseline_hash="$(OP_CACHE=false env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | LC_ALL=C sort -z | sha256sum)"
-            cache_desc="$1:caller-v1:${baseline_hash%% *}"
+            cache_desc="$1:env-v2"
             keyctl purge -p user "$cache_desc" >/dev/null 2>&1 || true
             key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$cache_desc" "$persistent_kr")"
             keyctl timeout "$key_id" 60
@@ -954,8 +995,7 @@ EOF
             set -e
             keyctl new_session >/dev/null 2>&1
             persistent_kr="$(keyctl get_persistent @s)"
-            baseline_hash="$(OP_CACHE=false env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | LC_ALL=C sort -z | sha256sum)"
-            cache_desc="$1:caller-v1:${baseline_hash%% *}"
+            cache_desc="$1:env-v2"
             keyctl purge -p user "$cache_desc" >/dev/null 2>&1 || true
             key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$cache_desc" "$persistent_kr")"
             keyctl timeout "$key_id" 60 >/dev/null 2>&1
@@ -970,8 +1010,7 @@ EOF
             set -e
             keyctl new_session >/dev/null 2>&1
             persistent_kr="$(keyctl get_persistent @s)"
-            baseline_hash="$(OP_CACHE=false env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | LC_ALL=C sort -z | sha256sum)"
-            cache_desc="$1:caller-v1:${baseline_hash%% *}"
+            cache_desc="$1:env-v2"
             keyctl purge -p user "$cache_desc" >/dev/null 2>&1 || true
             key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$cache_desc" "$persistent_kr")"
             keyctl timeout "$key_id" 60 >/dev/null 2>&1
@@ -995,8 +1034,7 @@ EOF
         keyctl session - bash -c '
             set -e
             persistent_kr="$(keyctl get_persistent @s)"
-            baseline_hash="$(OP_CACHE=false env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | LC_ALL=C sort -z | sha256sum)"
-            cache_desc="$1:caller-v1:${baseline_hash%% *}"
+            cache_desc="$1:env-v2"
             keyctl purge -p user "$cache_desc" >/dev/null 2>&1 || true
             key_id="$(printf "%s\0" "CACHED_VAR=from-cache" | keyctl padd user "$cache_desc" "$persistent_kr")"
             keyctl timeout "$key_id" 60

@@ -248,13 +248,20 @@ automatically; no action is needed either way. Full design and
 failure-mode contract: SPECIFICATION.md § "TTL cache of the
 op-resolved environment".
 
-Cache entries are bound to a versioned SHA-256 fingerprint of the caller's
-environment. This prevents a nested caller's partial diff from withholding
-credentials from another caller (issue #17); old unbound entries are ignored.
-Identical caller environments keep warm hits. Changing ambient variables can
-cause another miss and another TTL-bounded entry, a correctness tradeoff that
-can increase cache occupancy and resolution frequency. Fingerprinting streams
-NUL-delimited values in memory; it does not put them in argv or files.
+There is one cache entry per identifier + Environment, shared by every caller.
+On a miss, the populating `op run` executes under a fixed, minimal environment
+(only `HOME` and the token kept, `PATH` pinned, `OP_CACHE=false`). The diff
+against that fixed baseline is exactly what the Environment injects, so it
+never depends on who called. That keeps issue #17's guarantee: a nested caller
+that already holds the values cannot cache an incomplete diff. Concurrent misses
+wait on a per-Environment `flock` in `/run/user/<uid>/` and then re-check, so one
+expiry costs one `op run`, not one per waiting caller.
+
+Do NOT key the cache on the caller's environment again. The `caller-v1`
+design did, and it regressed the hit rate to 33-42% on a busy host.
+`TRACEPARENT`, agent and terminal session IDs, `PWD` and `SHLVL` change on
+almost every call, so almost every call paid ~11 CPU-seconds for a full
+`op run`.
 
 **A revoked/dead session keyring is the common case, not an edge
 case, and is handled automatically.** The Linux kernel session
@@ -275,13 +282,10 @@ the measured behavior behind this (including that the recovery is
 NOT purely local to the calling process — see that section).
 
 **Keyring quota headroom.** Cache entries are charged to the invoking
-uid's `kernel.keys.maxbytes`/`maxkeys`. Because entries are bound to the
-caller's environment fingerprint, one identifier can hold many ~5 KB
-entries at once (one per distinct caller environment within the TTL),
-not one: a busy host with many concurrent sessions and dispatches has
-been measured at 20+ entries for a single identifier. Size any sysctl
-drop-in for that fan-out, not for one entry per identifier. The kernel
-defaults (`maxbytes=20000`, `maxkeys=200`) fit only three or four entries.
+uid's `kernel.keys.maxbytes`/`maxkeys`. Each identifier holds one entry
+(about 1-6 KB, depending on the Environment) per uid, plus any older-format
+entries until they expire and are reaped. The kernel defaults
+(`maxbytes=20000`, `maxkeys=200`) are enough for a few identifiers.
 
 The wrapper manages its own share of the quota
 ([#19](https://github.com/thewoolleyman/1password-env-wrapper/issues/19)).

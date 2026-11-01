@@ -633,17 +633,37 @@ case "\$(uname -s)" in
                 fi
 
                 if [ -n "\$persistent_kr" ]; then
-                    # A diff belongs to its baseline, not just its Environment.
-                    # A nested caller can already carry every secret: replaying
-                    # its near-empty diff to a bare caller would omit them all.
-                    # Bind hits to a sorted, NUL-framed digest of the exact
-                    # baseline. Only the digest enters the key description;
-                    # values remain in memory, never argv or a temporary file.
-                    env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 "\${caller_env[@]}" | mapfile -d '' -t baseline_arr
-                    if ! baseline_hash="\$(printf '%s\\0' "\${baseline_arr[@]}" | LC_ALL=C sort -z | sha256sum)"; then
-                        err "TTL cache bypassed: could not fingerprint the caller environment"
-                        persistent_kr=""
-                    fi
+                    # A cached diff must not depend on WHO called. A nested
+                    # caller can already carry every secret, so diffing the
+                    # resolve against the caller's own environment would
+                    # cache a near-empty diff and replay it to a bare caller
+                    # (issue #17). Binding entries to a digest of the whole
+                    # caller environment fixed that but made the cache
+                    # useless in practice: per-invocation variables
+                    # (TRACEPARENT, terminal/session IDs, PWD, SHLVL, ...)
+                    # differ on nearly every call, so nearly every call
+                    # missed and paid for a full op run.
+                    #
+                    # Instead the cache-populating resolve runs against a
+                    # FIXED baseline: every exported variable is dropped
+                    # except HOME (op's config dir; constant per uid) and the
+                    # token, PATH is pinned, and OP_CACHE=false. The diff of
+                    # op's output against that same baseline is exactly what
+                    # the Environment injects, whoever called, so one entry
+                    # per IDENTIFIER + Environment serves every caller. op
+                    # itself is located with the caller's PATH first.
+                    op_bin="\$(command -v op 2>/dev/null)" || op_bin=""
+                    [ -n "\$op_bin" ] || persistent_kr=""  # the uncached path reports a missing op
+                    clean_run() (
+                        while IFS= read -r _clean_n; do
+                            case "\$_clean_n" in
+                                HOME|OP_SERVICE_ACCOUNT_TOKEN) ;;
+                                *) unset "\$_clean_n" 2>/dev/null || true ;;
+                            esac
+                        done < <(compgen -e)
+                        export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin OP_CACHE=false
+                        exec "\$@"
+                    )
                 fi
 
                 if [ -n "\$persistent_kr" ]; then
@@ -677,7 +697,11 @@ case "\$(uname -s)" in
                             [ "\$type" = user ] && [ "\$uid" = "\$EUID" ] || continue
                             case "\$desc" in op-env-wrapper-cache:*) ;; *) continue ;; esac
                             case "\$id" in ''|*[!0-9a-fA-F]*) continue ;; esac
-                            if [ "\$timeout" = expd ]; then
+                            # A cache key with no expiry (\`perm\`) is a key
+                            # whose \`keyctl timeout\` never landed: it would
+                            # replay forever, even across a token or
+                            # Environment change. Treat it as expired.
+                            if [ "\$timeout" = expd ] || [ "\$timeout" = perm ]; then
                                 if [ "\$1" = expired ]; then printf '%s\\n' "\$((16#\$id))"; fi
                                 continue
                             fi
@@ -698,38 +722,74 @@ case "\$(uname -s)" in
                 fi
 
                 if [ -n "\$persistent_kr" ]; then
-                    # Versioned namespace excludes every old caller-unbound key.
-                    cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}:caller-v1:\${baseline_hash%% *}"
+                    # One entry per IDENTIFIER + Environment, valid for every
+                    # caller (see clean_run above). The versioned suffix keeps
+                    # every older entry format (caller-bound \`caller-v1:\`,
+                    # caller-relative unversioned) from ever being replayed.
+                    cache_desc="op-env-wrapper-cache:\${IDENTIFIER}:\${ONEPASSWORD_ENVIRONMENT_ID}:env-v2"
+
+                    # Sets assign to the cached NAME=VALUE entries, or to ()
+                    # on a miss.
+                    cache_lookup() {
+                        assign=()
+                        if key_id="\$(keyctl search "\$persistent_kr" user "\$cache_desc" 2>/dev/null)"; then
+                            keyctl pipe "\$key_id" 2>/dev/null | mapfile -d '' -t assign
+                            # Sanity-check every replayed entry looks like
+                            # NAME=VALUE before trusting it as an \`env\`
+                            # operand — a value missing '=' entirely would
+                            # otherwise be interpreted by \`env\` as the START
+                            # OF THE COMMAND rather than an assignment. This
+                            # guards only against a corrupted/incompatible
+                            # cache entry, never against legitimate
+                            # multi-line values (NUL framing already makes
+                            # those unambiguous).
+                            for kv in "\${assign[@]}"; do
+                                case "\$kv" in
+                                    *=*) ;;
+                                    *) assign=(); break ;;
+                                esac
+                            done
+                        fi
+                        return 0
+                    }
 
                     # --- cache hit? ---
-                    assign=()
-                    if key_id="\$(keyctl search "\$persistent_kr" user "\$cache_desc" 2>/dev/null)"; then
-                        keyctl pipe "\$key_id" 2>/dev/null | mapfile -d '' -t assign
-                        # Sanity-check every replayed entry looks like
-                        # NAME=VALUE before trusting it as an \`env\` operand —
-                        # a value missing '=' entirely would otherwise be
-                        # interpreted by \`env\` as the START OF THE COMMAND
-                        # rather than an assignment. This guards only against
-                        # a corrupted/incompatible cache entry, never against
-                        # legitimate multi-line values (NUL framing already
-                        # makes those unambiguous).
-                        for kv in "\${assign[@]}"; do
-                            case "\$kv" in
-                                *=*) ;;
-                                *) assign=(); break ;;
-                            esac
-                        done
-                    fi
+                    cache_lookup
                     if [ "\${#assign[@]}" -gt 0 ]; then
                         exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${caller_env[@]}" "\${assign[@]}" "\$@"
                     fi
 
+                    # --- miss: serialize concurrent misses on one resolve.
+                    # Without this, every caller that arrives while the entry
+                    # is absent (first use, or the moment it expires) runs
+                    # its own op run, each ~10 CPU-seconds. A per-uid,
+                    # per-Environment flock in the invoker's private runtime
+                    # dir lets the first caller resolve while the rest wait,
+                    # then re-check the cache and hit. The lock file holds no
+                    # data. If the runtime dir or flock is unavailable, or
+                    # the wait times out, the caller simply resolves itself,
+                    # exactly as before. fd 9 is closed before every exec so
+                    # neither op nor the real command holds the lock.
+                    lock_dir="/run/user/\$EUID"
+                    if command -v flock >/dev/null 2>&1 && [ -d "\$lock_dir" ] && [ -O "\$lock_dir" ] && [ -w "\$lock_dir" ] \\
+                        && { exec 9>>"\$lock_dir/op-env-wrapper-cache-\${IDENTIFIER}-\${ONEPASSWORD_ENVIRONMENT_ID}.lock"; } 2>/dev/null; then
+                        if flock -w 90 9 2>/dev/null; then
+                            cache_lookup
+                            if [ "\${#assign[@]}" -gt 0 ]; then
+                                exec 9>&-
+                                exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${caller_env[@]}" "\${assign[@]}" "\$@"
+                            fi
+                        fi
+                    fi
+
                     # --- cache miss: resolve via an introspection target
-                    # (\`env -0\`, not the real command) so we learn exactly
-                    # which variables op injected, cache that diff, then
-                    # launch the real command ourselves. This is the ONLY
-                    # \`op run\` call on a cache miss — the real command never
-                    # runs under op.
+                    # (\`env -0\`, not the real command) against the fixed
+                    # baseline, so we learn exactly which variables the
+                    # Environment injects, cache that diff, then launch the
+                    # real command ourselves. This is the ONLY \`op run\`
+                    # call on a cache miss — the real command never runs
+                    # under op.
+                    clean_run env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 9>&- | mapfile -d '' -t baseline_arr
                     declare -A base_map=()
                     for kv in "\${baseline_arr[@]}"; do
                         base_map["\${kv%%=*}"]="\${kv#*=}"
@@ -743,13 +803,11 @@ case "\$(uname -s)" in
                         keyctl unlink "\$reap_id" "\$persistent_kr" >/dev/null 2>&1 || true
                     done || true
 
-                    caller_run op run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 | mapfile -d '' -t resolved_arr
+                    clean_run "\$op_bin" run --no-masking --environment "\$ONEPASSWORD_ENVIRONMENT_ID" -- env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE -0 9>&- | mapfile -d '' -t resolved_arr
                     op_rc="\${PIPESTATUS[0]}"
                     if [ "\$op_rc" -eq 0 ]; then
-                        assign=()
                         injected=()
                         for kv in "\${resolved_arr[@]}"; do
-                            assign+=("\$kv")
                             name="\${kv%%=*}"
                             value="\${kv#*=}"
                             if [ "\${base_map[\$name]+set}" != "set" ] || [ "\${base_map[\$name]}" != "\$value" ]; then
@@ -772,8 +830,14 @@ case "\$(uname -s)" in
                             store_tries=0
                             while :; do
                                 if padd_out="\$(printf '%s\\0' "\${injected[@]}" | keyctl padd user "\$cache_desc" "\$persistent_kr" 2>&1)"; then
-                                    keyctl timeout "\$padd_out" "\$cache_ttl" >/dev/null 2>&1 || true
-                                    stored=1
+                                    # An entry without its TTL would replay
+                                    # forever; never leave one behind.
+                                    if keyctl timeout "\$padd_out" "\$cache_ttl" >/dev/null 2>&1; then
+                                        stored=1
+                                    else
+                                        keyctl unlink "\$padd_out" "\$persistent_kr" >/dev/null 2>&1 || true
+                                        padd_out="could not set the entry's timeout; entry removed"
+                                    fi
                                     break
                                 fi
                                 case "\$padd_out" in *[Qq]uota*) ;; *) break ;; esac
@@ -795,7 +859,8 @@ case "\$(uname -s)" in
                                 err "TTL cache: failed to store the resolved Environment (keyctl: \${padd_out:-no error message}) — this invocation still succeeds, but every call will keep resolving via op run (one more draw on the 1Password service account's SHARED DAILY quota) until the keyring has room"
                             fi
                         fi
-                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${assign[@]}" "\$@"
+                        exec 9>&-
+                        exec env -u OP_SERVICE_ACCOUNT_TOKEN -u WRAPPER_STAGE "\${caller_env[@]}" "\${injected[@]}" "\$@"
                     fi
                     if [ "\$op_rc" -eq 9 ]; then
                         op_rate_limit_hint
