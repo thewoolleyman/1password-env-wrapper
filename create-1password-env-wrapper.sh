@@ -1037,7 +1037,7 @@ if [ "$PLATFORM" = "Linux" ]; then
     # (e.g. /home/ubuntu, which would belong to a non-root user and
     # trip op's "config dir not owned by current user" guard).
     if ! validation_output="$(HOME=/root OP_SERVICE_ACCOUNT_TOKEN="$validation_token" \
-            op environment read "$ONEPASSWORD_ENVIRONMENT_ID" 2>&1)"; then
+            op run --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- true 2>&1)"; then
         die "validation: 1Password could not read Environment '$ONEPASSWORD_ENVIRONMENT_ID': $validation_output"
     fi
 else
@@ -1048,7 +1048,7 @@ else
         die "validation: unable to read the credential we just stored in the macOS Keychain"
     fi
     if ! validation_output="$(OP_SERVICE_ACCOUNT_TOKEN="$validation_token" \
-            op environment read "$ONEPASSWORD_ENVIRONMENT_ID" 2>&1)"; then
+            op run --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- true 2>&1)"; then
         die "validation: 1Password could not read Environment '$ONEPASSWORD_ENVIRONMENT_ID': $validation_output"
     fi
 fi

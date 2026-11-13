@@ -58,10 +58,11 @@ explicitly forbidden on either platform — outside of the gitignored
 SHALL never exist on disk.
 
 The 1Password CLI (`op`) MUST be a build that supports
-`op environment read` and `op run --environment` — these are the
-"1Password Environments" beta features introduced in the
-`2.33.0-beta.02` line. The earliest verified compatible build is
-`2.35.0-beta.01`.
+`op run --environment` — the "1Password Environments" feature
+introduced in the `2.33.0-beta.02` line and stable from `2.41.0`. The
+earliest verified compatible build is `2.35.0-beta.01`. Neither the
+installer nor the wrapper uses `op environment read`, which 1Password
+deprecated on 2026-11-17 and removes on 2027-01-20.
 
 The installer is intended for VPS setup and ad-hoc maintenance work.
 It is not specific to Open Brain, although Open Brain is the first
@@ -207,8 +208,9 @@ Both platforms share the inputs (`IDENTIFIER`,
 `OP_SERVICE_ACCOUNT_TOKEN`, `ONEPASSWORD_ENVIRONMENT_ID`,
 `INSTALL_PREFIX`, `DEFAULT_SHELL`), the rendered wrapper bytes, the
 `.gitignore` discipline, and the validation step (decrypt/recover
-the token, then `op environment read` to confirm the Environment
-is reachable).
+the token, then `op run --environment … -- true` to confirm the
+Environment is reachable; `op environment read` is deprecated by
+1Password on 2026-11-17 and removed on 2027-01-20).
 
 ## The `IDENTIFIER` concept
 
@@ -607,8 +609,11 @@ The installer SHALL, in order:
     just-stored token from its platform-appropriate store
     (`systemd-creds decrypt` on Linux, `security
     find-generic-password -w` on macOS) and confirm the configured
-    Environment is reachable via `op environment read
-    "<ONEPASSWORD_ENVIRONMENT_ID>"`. Exit non-zero on failure,
+    Environment is reachable via `op run --environment
+    "<ONEPASSWORD_ENVIRONMENT_ID>" -- true`, the same `op run` path the
+    rendered wrapper uses at runtime. (`op environment read` was the
+    validation until 1Password deprecated it on 2026-11-17; it is removed
+    on 2027-01-20.) The validation prints no Environment value. Exit non-zero on failure,
     leaving any pre-existing installed wrapper and stored
     credential unchanged.
 12. **Ensure `.gitignore` entries** at the repository root contain
