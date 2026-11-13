@@ -1027,7 +1027,22 @@ fi
 # ---------------------------------------------------------------------------
 # Read-only validation against 1Password. Recover the just-stored token
 # from its platform-appropriate store and probe the configured Environment.
+#
+# validate_environment_access TOKEN -- probe the configured Environment with
+# the freshly stored token through `op run --environment <id> -- true`, the
+# same `op run` path the rendered wrapper uses at runtime. It prints no
+# Environment value. `op environment read` is NOT used: 1Password deprecated
+# it on 2026-11-17 and removes it on 2027-01-20. test/wrapper-render.bats
+# extracts this function and pins the call.
 # ---------------------------------------------------------------------------
+validate_environment_access() {
+    local validation_output
+    if ! validation_output="$(OP_SERVICE_ACCOUNT_TOKEN="$1" \
+            op run --environment "$ONEPASSWORD_ENVIRONMENT_ID" -- true 2>&1)"; then
+        die "validation: 1Password could not read Environment '$ONEPASSWORD_ENVIRONMENT_ID': $validation_output"
+    fi
+}
+
 if [ "$PLATFORM" = "Linux" ]; then
     if ! validation_token="$(systemd-creds decrypt --name="$SYSTEMD_CRED_NAME" "$SYSTEMD_CRED_PATH" - 2>/dev/null)"; then
         die "validation: unable to decrypt the credential we just installed"
@@ -1036,10 +1051,7 @@ if [ "$PLATFORM" = "Linux" ]; then
     # rather than whatever HOME the invoking sudo session preserved
     # (e.g. /home/ubuntu, which would belong to a non-root user and
     # trip op's "config dir not owned by current user" guard).
-    if ! validation_output="$(HOME=/root OP_SERVICE_ACCOUNT_TOKEN="$validation_token" \
-            op environment read "$ONEPASSWORD_ENVIRONMENT_ID" 2>&1)"; then
-        die "validation: 1Password could not read Environment '$ONEPASSWORD_ENVIRONMENT_ID': $validation_output"
-    fi
+    HOME=/root validate_environment_access "$validation_token"
 else
     if ! validation_token="$(security find-generic-password \
             -s "$MACOS_KEYCHAIN_SERVICE" \
@@ -1047,12 +1059,9 @@ else
             -w 2>/dev/null)"; then
         die "validation: unable to read the credential we just stored in the macOS Keychain"
     fi
-    if ! validation_output="$(OP_SERVICE_ACCOUNT_TOKEN="$validation_token" \
-            op environment read "$ONEPASSWORD_ENVIRONMENT_ID" 2>&1)"; then
-        die "validation: 1Password could not read Environment '$ONEPASSWORD_ENVIRONMENT_ID': $validation_output"
-    fi
+    validate_environment_access "$validation_token"
 fi
-unset validation_token validation_output
+unset validation_token
 
 # ---------------------------------------------------------------------------
 # Ensure .gitignore entries.

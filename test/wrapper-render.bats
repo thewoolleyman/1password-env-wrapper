@@ -1095,3 +1095,57 @@ assert_success_local() {
     [ "$status" -eq 0 ] || { echo "expected exit 0, got $status" >&2; return 1; }
     [ "$actual" = "$expected" ] || { echo "expected '$expected', got '$actual'" >&2; return 1; }
 }
+
+# ---------------------------------------------------------------------------
+# Installer post-install validation (hxi-xyjzrg). `op environment read` was
+# deprecated by 1Password on 2026-11-17 and is removed on 2027-01-20; the
+# installer validates with `op run --environment <id> -- true` instead.
+# The real validate_environment_access is lifted from the installer and run
+# against a recording stub `op`.
+# ---------------------------------------------------------------------------
+
+_validation_harness() {
+    local harness="$BATS_TEST_TMPDIR/validation-harness.sh" stub_dir="$BATS_TEST_TMPDIR/stub-bin"
+    mkdir -p "$stub_dir"
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'printf "%s\n" "$*" > "$OP_ARGS_LOG"'
+        printf '%s\n' 'printf "TOKEN_SEEN=%s\n" "${OP_SERVICE_ACCOUNT_TOKEN:-}" >> "$OP_ARGS_LOG"'
+        printf '%s\n' 'if [ "${OP_STUB_FAIL:-0}" = 1 ]; then echo "[ERROR] stub: environment not found" >&2; exit 1; fi'
+        printf '%s\n' 'exit 0'
+    } > "$stub_dir/op"
+    chmod +x "$stub_dir/op"
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+        printf '%s\n' 'set -Eeuo pipefail'
+        printf '%s\n' "ONEPASSWORD_ENVIRONMENT_ID='env-SAMPLE'"
+        printf '%s\n' 'die() { printf "create-1password-env-wrapper.sh: %s\n" "$*" >&2; exit 1; }'
+        awk 'f && $0=="}" {print; exit} /^validate_environment_access\(\) \{$/ {f=1} f {print}' "$INSTALLER"
+        printf '%s\n' 'validate_environment_access "stub-token-value"'
+        printf '%s\n' 'echo VALIDATED'
+    } > "$harness"
+    grep -q '^validate_environment_access() {' "$harness" || { echo "FATAL: could not extract validate_environment_access" >&2; return 1; }
+    printf '%s %s\n' "$harness" "$stub_dir"
+}
+
+@test "installer validation probes the Environment with op run --environment <id> -- true, never op environment read" {
+    read -r harness stub_dir < <(_validation_harness)
+    export OP_ARGS_LOG="$BATS_TEST_TMPDIR/op-args.log"
+    run env PATH="$stub_dir:$PATH" OP_ARGS_LOG="$OP_ARGS_LOG" bash "$harness"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *VALIDATED* ]]
+    [ "$(head -1 "$OP_ARGS_LOG")" = "run --environment env-SAMPLE -- true" ]
+    grep -qx 'TOKEN_SEEN=stub-token-value' "$OP_ARGS_LOG"
+    ! grep -qE '^[^#]*op environment read' "$INSTALLER"
+}
+
+@test "installer validation surfaces the refusal and exits non-zero when op cannot read the Environment" {
+    read -r harness stub_dir < <(_validation_harness)
+    export OP_ARGS_LOG="$BATS_TEST_TMPDIR/op-args.log"
+    run env PATH="$stub_dir:$PATH" OP_ARGS_LOG="$OP_ARGS_LOG" OP_STUB_FAIL=1 bash "$harness"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"validation: 1Password could not read Environment 'env-SAMPLE'"* ]]
+    [[ "$output" == *"stub: environment not found"* ]]
+    [[ "$output" != *VALIDATED* ]]
+    [[ "$output" != *stub-token-value* ]]
+}
