@@ -101,6 +101,58 @@ In neither case does the raw token end up in a plaintext file on
 disk (other than the gitignored `.env.local`, which the operator
 may delete after a successful install).
 
+## Installing on an additional host
+
+Use this for any host that needs an existing identifier's wrapper, for example a new
+interactive AI box, a gaming PC or a worker. Each host gets its OWN service-account
+token, so one host can be revoked without touching the others. Never copy another host's
+seal.
+
+1. **Create the host's service account** on 1Password.com, not in the desktop app:
+   Developer → Directory → Other → Infrastructure Secrets Management → Create a Service
+   Account. Name it `<host>-<identifier>`. Grant **read access to the one Environment**
+   only, chosen in the wizard: no vaults, and no vault creation. Environment access is
+   fixed at creation, so it cannot be added later. Copy the token; it is shown once.
+2. **Prepare the host.** Clone this repository. Create the Linux group named after the
+   identifier (the installer refuses to create it) and add the session account to it.
+   Install a 1Password CLI that supports `op run --environment`.
+3. **Put the token in a mode-0600 file** on the host, without echoing it:
+
+   ```sh
+   install -d -m 0700 /tmp/.1pass
+   read -rs T && printf 'OP_SERVICE_ACCOUNT_TOKEN=%s\n' "$T" > /tmp/.1pass/<host>-<identifier>.env && unset T
+   chmod 600 /tmp/.1pass/<host>-<identifier>.env
+   ```
+
+4. **Install as root**, reading the token from that file through the environment only:
+
+   ```sh
+   sudo -n bash -c 'set -euo pipefail; set -a; . /tmp/.1pass/<host>-<identifier>.env; set +a;
+     export IDENTIFIER=<identifier> ONEPASSWORD_ENVIRONMENT_ID=<environment-id> SUDO_USER=<session-account>;
+     ./create-1password-env-wrapper.sh'
+   ```
+
+   The installer seals the token with systemd-creds, installs
+   `/usr/local/bin/with-<identifier>-env.sh` and its sudoers fragment, and validates the
+   Environment with `op run --environment <id> -- true`. It refuses with a named error if
+   1Password cannot read the Environment.
+5. **Shred the token file**: `shred -u /tmp/.1pass/<host>-<identifier>.env && rmdir /tmp/.1pass`.
+6. **Read back a real value through the wrapper.** This tells success apart from a silent
+   empty answer. List variable NAMES only, never values:
+
+   ```sh
+   with-<identifier>-env.sh -- python3 -c 'import os; print(sorted(os.environ))'
+   ```
+
+   Then run one real command that needs those variables. For a livespec identifier,
+   that's a ledger read from a checkout of that tenant's repository, through the host's
+   route to the shared Dolt server:
+   `with-livespec-env.sh -- bd show <work-item-id>`. It must print the item.
+   An empty or "not found" answer means the install is not proven.
+
+Never print or paste a token value, and never use `env | cut` to list names: it prints
+continuation lines of multi-line values such as private keys.
+
 ## What's in this repo
 
 | File | Purpose |
