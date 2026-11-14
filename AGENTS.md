@@ -11,9 +11,12 @@ Read the fleet's distributed SendMessage protocol
 before messaging, asking, directing or answering another agent
 session on any host, and before running `herdr pane send-text`,
 `herdr pane run`, `herdr agent prompt` or `tmux send-keys` against a
-pane you did not create. Claude sessions talk through `SendMessage`
-(across machines via Remote Control), never by typing into each
-other's panes (maintainer ruling 2026-11-14).
+pane you did not create. Prefer `SendMessage` (across machines via
+Remote Control) to message another Claude session, because text typed
+into its pane can interrupt the maintainer. Typing into a pane is
+still allowed and nothing blocks it; use it when necessary (a slash
+command, a picker, a session `SendMessage` cannot reach, a Codex or pi
+seat) (maintainer ruling 2026-11-14).
 
 ## What this repo is
 
